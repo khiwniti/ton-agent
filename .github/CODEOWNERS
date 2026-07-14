@@ -1,0 +1,15 @@
+# CODEOWNERS — auto-request these GitHub handles as reviewers on every PR.
+# Replace @khiwniti with your actual GitHub username (or add team alts).
+# Format: <path>  <owners>
+
+*                               @khiwniti
+
+# Agent runtime (high blast radius — needs sign-off before merge)
+/apps/agent/                    @khiwniti
+/packages/shared/               @khiwniti
+
+# Web app
+/apps/web/                      @khiwniti
+
+# CI / repo config
+/.github/                       @khiwniti

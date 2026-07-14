@@ -92,10 +92,10 @@ The web app uses Supabase for persistence + realtime streams. See
 
 ## Branching strategy
 
-- `main` — protected, only reviewed PRs merge here. Treat as the stable backbone.
-- `dev` — long-lived dev integration branch on the PC.
-- `feat/*`, `fix/*` — short-lived feature branches off `dev`.
-- This initial commit lands on `feat/initial-migration-from-sniper-bots`.
+- `main` — **protected**: 1 approving review, no force-push, no delete, linear history. Stable backbone. Never commit here directly.
+- `feat/initial-migration-from-sniper-bots` — **current default**, active dev work.
+- Future `feat/*`, `fix/*` branch off the latest dev branch, open PRs against `main` (or against a `dev` integration branch if you add one).
+- This initial commit's history lives on the feature branch above; merge to `main` only after CI passes + review.
 
 ---
 

@@ -1,0 +1,21 @@
+name: CI — agent runtime (typecheck)
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install (workspace, legacy peer deps)
+        run: npm install --legacy-peer-deps
+      - name: Typecheck agent runtime
+        run: npx --workspace apps/agent tsc -p apps/agent/tsconfig.json --noEmit
