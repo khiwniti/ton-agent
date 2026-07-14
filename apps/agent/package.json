@@ -1,0 +1,45 @@
+{
+  "name": "@ton-agent/agent-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Headless 24/7 THIN TRADING AGENT — runs on Termux or VPS. LangChain ReAct brain, NVIDIA NIM, TON wallet signer, Ston.fi/DeDust router, mempool radar, MCP tools, pushes events to the web app.",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "audit": "ts-node src/cli/audit-cli.ts",
+    "trade": "ts-node src/cli/manual-trade.ts",
+    "wallet": "ts-node src/cli/wallet-info.ts",
+    "plan": "ts-node src/cli/agent-plan.ts",
+    "status": "ts-node src/cli/status-cli.ts"
+  },
+  "dependencies": {
+    "@dedust/sdk": "^0.8.7",
+    "@langchain/anthropic": "^1.0.0",
+    "@langchain/core": "^1.0.0",
+    "@langchain/langgraph": "^1.0.0",
+    "@langchain/openai": "^1.5.0",
+    "@langchain/tavily": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "@ston-fi/sdk": "^2.7.0",
+    "@ton/core": "^0.63.1",
+    "@ton/crypto": "^3.3.0",
+    "@ton/sandbox": "^0.42.0",
+    "@ton/ton": "^16.3.0",
+    "axios": "^1.17.0",
+    "dotenv": "^16.4.5",
+    "langchain": "^1.5.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.8"
+  },
+  "optionalDependencies": {
+    "teleton": "^0.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.2",
+    "@types/ws": "^8.5.13",
+    "ts-node": "^10.9.2",
+    "typescript": "^6.0.3"
+  }
+}

@@ -1,0 +1,30 @@
+# ---- secrets / env ----
+.env
+.env.*
+!.env.example
+*.local
+
+# ---- node / build ----
+node_modules/
+dist/
+.next/
+.turbo/
+vercel/
+.vercel/
+
+# ---- editor / os ----
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# ---- pi / agent harness ----
+.probe/
+probe/
+*.tgz
+
+# ---- private keys / wallets ----
+*.key
+*.pem
+wallet-*.json
+mnemonic-*.txt
