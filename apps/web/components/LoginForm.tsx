@@ -93,7 +93,7 @@ function LoginFormInner() {
   async function startWalletFlow() {
     setPhase("challenging");
     setError(null);
-    openedAt.current = null;
+    walletConnectedAt.current = null;
     try {
       // If a wallet is already connected from a previous session, disconnect
       // first so we can initiate a FRESH connection with the ton_proof challenge.
@@ -135,19 +135,76 @@ function LoginFormInner() {
   }
 
   /**
-   * Timeout watchdog: if 30s pass with a connected wallet but no ton_proof
-   * surfaced, drop to "stuck" and surface a recoverable error message.
+   * Extract ton_proof from wallet.connectItems — handles both object form
+   * (newer spec) and array form (older spec). Returns null if not present.
    */
-  const openedAt = useRef<number | null>(null);
+  function extractProof(items: unknown): {
+    payload: string;
+    signature: string;
+    state_init?: string;
+  } | null {
+    if (!items) return null;
+
+    if (!Array.isArray(items) && typeof items === "object") {
+      const tp = (items as { ton_proof?: unknown }).ton_proof;
+      if (tp && typeof tp === "object") {
+        const p = tp as { payload?: unknown; signature?: unknown; state_init?: unknown };
+        if (typeof p.payload === "string" && typeof p.signature === "string") {
+          return {
+            payload: p.payload,
+            signature: p.signature,
+            state_init: typeof p.state_init === "string" ? p.state_init : undefined,
+          };
+        }
+      }
+    }
+
+    if (Array.isArray(items)) {
+      const tp = items.find((i: { type?: unknown }) => i?.type === "ton_proof") as
+        | { payload?: unknown; signature?: unknown; state_init?: unknown }
+        | undefined;
+      if (
+        tp &&
+        typeof tp.payload === "string" &&
+        typeof tp.signature === "string"
+      ) {
+        return {
+          payload: tp.payload,
+          signature: tp.signature,
+          state_init: typeof tp.state_init === "string" ? tp.state_init : undefined,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Timeout watchdog: after a wallet CONNECTS, we give PROOF_TIMEOUT_MS
+   * for the connectItems.ton_proof to arrive (bridge event propagation
+   * can lag behind the wallet object). If the timer expires, drop to
+   * "stuck" with a recoverable message.
+   */
+  const walletConnectedAt = useRef<number | null>(null);
+
   useEffect(() => {
     if (!wallet) {
-      openedAt.current = null;
+      walletConnectedAt.current = null;
       return;
     }
-    if (phase === "opening") openedAt.current = Date.now();
-    if (openedAt.current && phase !== "ok" && phase !== "idle") {
-      const elapsed = Date.now() - openedAt.current;
+    // Only start the timer once — first time wallet becomes truthy after opening.
+    if (phase === "opening" && walletConnectedAt.current === null) {
+      walletConnectedAt.current = Date.now();
+    }
+
+    // Check timeout.
+    if (walletConnectedAt.current && phase !== "ok" && phase !== "idle") {
+      const elapsed = Date.now() - walletConnectedAt.current;
       if (elapsed > PROOF_TIMEOUT_MS) {
+        console.warn(
+          "[LoginForm] proof timeout — wallet connected but connectItems.ton_proof never arrived. wallet=",
+          wallet,
+        );
         setError(
           "Connected wallet did not produce a proof signature. Some wallets (older OpenMask, certain Ledger flows) do not support TON Connect proof-of-ownership. Try Tonkeeper.",
         );
@@ -158,85 +215,144 @@ function LoginFormInner() {
   }, [wallet, phase]);
 
   /**
-   * Phase verify step: as soon as useTonWallet() returns a connected wallet,
-   * look for a `ton_proof` connectItem. The TON Connect UI SDK exposes
-   * `wallet.connectItems` — handle it as either object form (newer spec) or
-   * array form (older spec) defensively.
+   * Proof detection with polling.
+   *
+   * When a wallet connects via the bridge (e.g. scanning a QR code), the
+   * SDK sets the wallet object immediately, but the `connectItems` (which
+   * contain the ton_proof signature) may arrive a few hundred milliseconds
+   * later as bridge events propagate. We poll every 500ms for up to 15s to
+   * catch late-arriving proofs.
    */
+  const proofTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollCountRef = useRef(0);
+  const MAX_POLLS = 30; // 30 × 500ms = 15 seconds
+
+  // Cleanup interval on unmount.
   useEffect(() => {
-    if (!wallet || phase === "verifying" || phase === "ok" || phase === "stuck") return;
+    return () => {
+      if (proofTimerRef.current) {
+        clearInterval(proofTimerRef.current);
+        proofTimerRef.current = null;
+      }
+    };
+  }, []);
 
-    const items = wallet.connectItems;
-    // After the guards below, payload + signature are non-null strings.
-    // We Materialise the proof object as a concrete shape so the body that
-    // /api/auth/wallet/verify receives is type-stable.
-    let proofMaterialised: {
-      payload: string;
-      signature: string;
-      state_init?: string;
-    } | null = null;
+  /**
+   * Keep a ref pointing to the latest wallet object so the polling
+   * interval always reads the most current reference.  The SDK creates
+   * a new wallet object when connectItems arrive (via bridge events);
+   * without this ref the interval's closure would keep checking the
+   * initial (pre-connectItems) object and never find the proof.
+   */
+  const walletRef = useRef(wallet);
+  walletRef.current = wallet;
 
-    if (items && !Array.isArray(items) && typeof items === "object") {
-      const tp = (items as { ton_proof?: unknown }).ton_proof;
-      if (tp && typeof tp === "object") {
-        const p = tp as { payload?: unknown; signature?: unknown; state_init?: unknown };
-        if (typeof p.payload === "string" && typeof p.signature === "string") {
-          proofMaterialised = {
-            payload: p.payload,
-            signature: p.signature,
-            state_init: typeof p.state_init === "string" ? p.state_init : undefined,
-          };
+  // Wallet-connected → start polling for connectItems.
+  useEffect(() => {
+    // Guards: only start polling when wallet connects during opening phase.
+    if (!wallet || phase !== "opening") {
+      if (proofTimerRef.current) {
+        clearInterval(proofTimerRef.current);
+        proofTimerRef.current = null;
+      }
+      pollCountRef.current = 0;
+      return;
+    }
+
+    // Already polling.
+    if (proofTimerRef.current) return;
+
+    if (process.env.NODE_ENV === "development") {
+      console.log(
+        "[LoginForm] wallet connected, polling for connectItems.ton_proof...",
+        "hasConnectItems=",
+        !!wallet.connectItems,
+        "wallet keys:",
+        Object.keys(wallet),
+      );
+    }
+
+    proofTimerRef.current = setInterval(() => {
+      pollCountRef.current++;
+
+      // Use the ref so we always check the latest wallet object.
+      const currentWallet = walletRef.current;
+      const proof = extractProof(currentWallet?.connectItems);
+      if (proof) {
+        if (process.env.NODE_ENV === "development") {
+          console.log(
+            "[LoginForm] ton_proof found after",
+            pollCountRef.current * 500,
+            "ms",
+          );
         }
-      }
-    }
-    if (!proofMaterialised && Array.isArray(items)) {
-      const tp = items.find((i: { type?: unknown }) => i?.type === "ton_proof") as
-        | { payload?: unknown; signature?: unknown; state_init?: unknown }
-        | undefined;
-      if (
-        tp &&
-        typeof tp.payload === "string" &&
-        typeof tp.signature === "string"
-      ) {
-        proofMaterialised = {
-          payload: tp.payload,
-          signature: tp.signature,
-          state_init: typeof tp.state_init === "string" ? tp.state_init : undefined,
-        };
-      }
-    }
+        clearInterval(proofTimerRef.current!);
+        proofTimerRef.current = null;
+        pollCountRef.current = 0;
 
-    if (!proofMaterialised) return;
+        // Fire the verify request (currentWallet is guaranteed non-null here
+        // because we just read a proof from it above).
+        void submitProof(proof, currentWallet!);
+        return;
+      }
 
+      // Max polls reached — give up and trigger stuck state directly.
+      if (pollCountRef.current >= MAX_POLLS) {
+        if (process.env.NODE_ENV === "development") {
+          console.warn(
+            "[LoginForm] ton_proof never arrived after",
+            MAX_POLLS * 500,
+            "ms. connectItems=",
+            currentWallet?.connectItems,
+          );
+        }
+        clearInterval(proofTimerRef.current!);
+        proofTimerRef.current = null;
+        pollCountRef.current = 0;
+        setPhase("stuck");
+        setError(
+          "Connected wallet did not produce a proof signature. Some wallets (older OpenMask, certain Ledger flows) do not support TON Connect proof-of-ownership. Try Tonkeeper.",
+        );
+      }
+    }, 500);
+  }, [wallet, phase]);
+
+  async function submitProof(
+    proof: { payload: string; signature: string; state_init?: string },
+    w: NonNullable<ReturnType<typeof useTonWallet>>,
+  ) {
+    if (phase === "verifying" || phase === "ok") return;
     setPhase("verifying");
     setError(null);
-    void (async () => {
-      try {
-        const r = await fetch("/api/auth/wallet/verify", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            wallet_address: wallet.account.address,
-            payload: proofMaterialised!.payload,
-            signature: proofMaterialised!.signature,
-            state_init: proofMaterialised!.state_init,
-            public_key: wallet.account.publicKey ?? undefined,
-          }),
-        });
-        const body = await r.json().catch(() => ({}));
-        if (!r.ok) {
-          throw new Error(body?.error ?? `verify HTTP ${r.status}`);
-        }
-        setPhase("ok");
-        router.push(next);
-        router.refresh();
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        setError(msg);
-        setPhase("error");
+    try {
+      console.log("[LoginForm] POST /api/auth/wallet/verify address=",
+        w.account?.address?.slice(0, 10) + "...");
+      const r = await fetch("/api/auth/wallet/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          wallet_address: w.account.address,
+          payload: proof.payload,
+          signature: proof.signature,
+          state_init: proof.state_init,
+          public_key: w.account.publicKey ?? undefined,
+        }),
+      });
+      const body = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        throw new Error(body?.error ?? `verify HTTP ${r.status}`);
       }
-    })();
-  }, [wallet, phase, router, next]);
+      console.log("[LoginForm] verify OK, redirecting to", next);
+      setPhase("ok");
+      router.push(next);
+      router.refresh();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn("[LoginForm] verify failed:", msg);
+      setError(msg);
+      setPhase("error");
+    }
+  }
 
   async function submitPassword(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
