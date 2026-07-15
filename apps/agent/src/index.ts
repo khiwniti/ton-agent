@@ -155,8 +155,12 @@ async function main() {
             res.writeHead(404, { "Content-Type": "text/plain" });
             res.end("not found");
         });
-        server.listen(HEALTH_PORT, "127.0.0.1", () => {
-            log.ok("HEALTH", `/healthz listening on 127.0.0.1:${HEALTH_PORT}`);
+        // Bind to 0.0.0.0 inside Docker so Railway's platform-level
+        // health checks can reach the /healthz endpoint. In production
+        // the port is not exposed publicly — it's only accessible via
+        // the container's internal networking (Railway / Docker bridge).
+        server.listen(HEALTH_PORT, "0.0.0.0", () => {
+            log.ok("HEALTH", `/healthz listening on 0.0.0.0:${HEALTH_PORT}`);
         });
         loops.push({
             name: "healthServer",
