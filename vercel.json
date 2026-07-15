@@ -5,7 +5,7 @@
   "outputDirectory": "apps/web/.next",
   "installCommand": "npm install --legacy-peer-deps",
   "functions": {
-    "apps/web/app/api/ingest/route.ts": {
+    "app/api/ingest/route": {
       "maxDuration": 30
     }
   }
