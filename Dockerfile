@@ -41,8 +41,13 @@ RUN npm prune --omit=dev --legacy-peer-deps
 FROM node:20-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production \
-    HEALTH_PORT=9090 \
     DATA_DIR=/app/data
+
+# HEALTH_PORT is intentionally NOT baked into the image — it is supplied
+# at runtime via docker-compose (compose sets HEALTH_PORT="9090") or via
+# Railway's $PORT env var (the container falls back to process.env.PORT
+# in index.ts). Keeping HEALTH_PORT out of the image ensures the auto-
+# detection logic for Railway works without an explicit override.
 
 # curl is required for the container HEALTHCHECK below.
 RUN apt-get update \
