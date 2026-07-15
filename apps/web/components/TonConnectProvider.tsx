@@ -55,8 +55,6 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
       bridgeUrl: "https://tonconnectbridge.mytonwallet.org/bridge/",
       // Official universal link (opens the mobile app via TON Connect QR code)
       universalLink: "https://connect.mytonwallet.org",
-      // TON Connect SDK needed the hash as a path param on the universal link
-      // for some versions, but the bare domain is correct for v2.
       // MyTonWallet also supports the custom scheme: mytonwallet-tc://
       jsBridgeKey: "mytonwallet",
     },
