@@ -64,16 +64,17 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Bring over the compiled output, the workspace shared package (its
-# symlink target), and the pruned production node_modules.
+# Bring over the compiled output and production node_modules.
+# NOTE: packages/shared/ source is NOT copied — only the compiled dist/
+# output is injected below into the agent's node_modules. This prevents
+# any accidental TypeScript source resolution at runtime.
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/apps/agent/dist ./apps/agent/dist
 COPY --from=builder /app/apps/agent/package.json ./apps/agent/package.json
-COPY --from=builder /app/packages/shared ./packages/shared
 COPY --from=builder /app/package.json ./package.json
 
 # SQLite lives here; mount a volume over it in production (see compose).
-RUN mkdir -p /app/data && chown -R node:node /app
+RUN mkdir -p /app/data && mkdir -p /app/packages/shared/dist && chown -R node:node /app
 
 # Drop privileges.
 USER node
@@ -85,14 +86,14 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# Inject the compiled shared package directly into node_modules.
-# This avoids Docker COPY symlink resolution issues and chown/perms
-# edge cases with workspace symlinks at runtime under USER node.
-RUN rm -rf /app/node_modules/@ton-agent/shared && \
-    mkdir -p /app/node_modules/@ton-agent/shared && \
-    cp -r /app/packages/shared/dist/* /app/node_modules/@ton-agent/shared/ && \
-    printf '{"name":"@ton-agent/shared","main":"./index.js","types":"./index.d.ts","private":true}' \
-    > /app/node_modules/@ton-agent/shared/package.json && \
+# Inject the compiled shared dist directly into the agent's node_modules
+# as a standalone package. The shared source (src/) is intentionally NOT
+# in the runtime image, preventing any accidental .ts file resolution.
+COPY --from=builder /app/packages/shared/dist /app/packages/shared/dist
+RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
+    > /app/packages/shared/package.json && \
+    rm -rf /app/node_modules/@ton-agent/shared && \
+    ln -s ../../packages/shared /app/node_modules/@ton-agent/shared && \
     node -e "require('@ton-agent/shared'); console.log('[RUNTIME] @ton-agent/shared OK');"
 
 CMD ["node", "apps/agent/dist/index.js"]
