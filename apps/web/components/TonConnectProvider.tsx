@@ -40,7 +40,24 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
   // Restrict the wallets list to keep the SDK from probing bridges that
   // get CSP-blocked. MyTonWallet uses its own bridge; the universal flow
   // defaults to Tonkeeper's bridge. Both are whitelisted in the CSP.
-  //
+  const restrictedWallets = [
+    {
+      name: "Tonkeeper",
+      imageUrl: "https://tonkeeper.com/assets/tonconnect-icon.png",
+      aboutUrl: "https://tonkeeper.com",
+      bridgeUrl: "https://bridge.tonapi.io",
+      universalLink: "https://app.tonkeeper.com/ton-connect",
+    },
+    {
+      name: "MyTonWallet",
+      imageUrl: "https://mytonwallet.io/icon-192.png",
+      aboutUrl: "https://mytonwallet.io",
+      bridgeUrl: "https://tonconnectbridge.mytonwallet.org",
+      universalLink: "https://connect.mytonwallet.io/ton-connect",
+      jsBridgeKey: "mytonwallet",
+    },
+  ];
+
   // v2.4.4's provider types don't always include bridgeUrl/preferences.
   // Cast to `any` so the runtime is correct while the type surface stabilises.
   const providerProps = {
@@ -48,6 +65,7 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
     // Universal connection QR code uses this bridge. Bare domain — the
     // SDK appends the path it needs (e.g. /bridge/events).
     bridgeUrl: "https://bridge.tonapi.io",
+    walletsList: restrictedWallets,
     preferences: { theme: "DARK" },
   } as any;
 
