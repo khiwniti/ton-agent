@@ -10,7 +10,7 @@
 # /healthz endpoint. If you don't need health checks, remove the whole
 # [[services]] section and the app runs as a worker (no public port).
 
-app = "ton-agent"
+app = "ton-agent-runtime"
 
 [build]
   dockerfile = "Dockerfile"
@@ -19,6 +19,8 @@ app = "ton-agent"
   NODE_ENV = "production"
   # DATA_DIR must match the volume mount destination below.
   DATA_DIR = "/app/data"
+  # Health server port — matches internal_port in [[services]] below.
+  HEALTH_PORT = "8080"
 
 # Persistent volume for SQLite database.
 # Create once:  fly volumes create ton_agent_data --size 1 --region ord
