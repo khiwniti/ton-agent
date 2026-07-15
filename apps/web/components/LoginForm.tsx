@@ -95,6 +95,15 @@ function LoginFormInner() {
     setError(null);
     openedAt.current = null;
     try {
+      // If a wallet is already connected from a previous session, disconnect
+      // first so we can initiate a FRESH connection with the ton_proof challenge.
+      // Without this, the SDK throws "Wallet connection called but wallet already
+      // connected" and the proof flow never completes.
+      if (wallet) {
+        await tonConnectUI.disconnect();
+        await new Promise((r) => setTimeout(r, 150)); // let SDK flush state
+      }
+
       const ch = await fetch("/api/auth/wallet/challenge", {
         method: "POST",
       });
