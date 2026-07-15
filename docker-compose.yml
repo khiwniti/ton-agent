@@ -1,0 +1,50 @@
+# ====================================================================
+# 🐳 docker-compose — TON AGENT RUNTIME (apps/agent)
+# Usage:  docker compose up --build
+# Health: http://127.0.0.1:9090/healthz
+# ====================================================================
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ton-agent-runtime:latest
+    container_name: ton-agent
+    # Secrets & config are supplied at runtime — NEVER baked into the image.
+    env_file:
+      - .env
+    environment:
+      # Ensure the DB path matches the mounted volume below.
+      DATA_DIR: /app/data
+      HEALTH_PORT: "9090"
+    # Persist the SQLite database on the host so state survives restarts.
+    volumes:
+      - ./data:/app/data
+    # Health server bound to LOOPBACK ONLY — never expose the agent publicly.
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: unless-stopped
+    # Compose-level healthcheck (mirrors the Dockerfile HEALTHCHECK).
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    # Sensible resource hygiene for a single-tenant trading process.
+    stop_grace_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── web ─────────────────────────────────────────────────────────────
+  # The web dashboard (apps/web) is NOT run here. It is deployed to
+  # Vercel (see vercel.json). The agent reaches it via PUBLIC_WEBHOOK_URL
+  # and the browser reads events back through the Vercel API.
+  #
+  # If you ever want to self-host the web app instead of Vercel, add a
+  # service here that builds apps/web and exposes port 3000. Left out on
+  # purpose to keep this file focused on the agent runtime.

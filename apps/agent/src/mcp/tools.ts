@@ -14,15 +14,19 @@ import { z } from "zod";
 import { CONFIG } from "../config";
 import { log } from "../logger";
 import { makeClient } from "../wallet/wallet";
+import { tonapiGet } from "../http/tonapi";
+import { postEnvelope } from "../webhook";
 import * as audit from "../security/audit";
-import * as dex from "../dex/router";
-import axios from "axios";
+import { getCoordinator, isCoordinatorStarted, ALL_TIERS, type Tier } from "../core/coordinator";
+import { positionsStore } from "../storage/store";
+import { newId } from "@ton-agent/shared";
 
 // ─────────────────────────────── 1. WALLET BALANCE ───────────────────────────────
 export const getWalletBalanceTool = tool(
-    async ({}: Record<string, never>, opts: any) => {
+    async ({}: Record<string, never>, _opts?: any) => {
         const client = makeClient();
-        const w = await (await import("../wallet/wallet")).openWallet(client, await (await import("../wallet/wallet")).loadKeyPair());
+        const walletMod = await import("../wallet/wallet");
+        const w = await walletMod.openWallet(client, await walletMod.loadKeyPair());
         const bal = await w.getBalance();
         return {
             address: w.address.toString(),
@@ -55,31 +59,43 @@ export const auditJettonTool = tool(
 
 // ─────────────────────────────── 3. SWAP EXECUTE ───────────────────────────────
 export const executeSwapTool = tool(
-    async ({ jettonMaster, amountTon, dex: dexName, side }) => {
-        log.banner("EXECUTE", `side=${side} amount=${amountTon} TON jetton=${jettonMaster}`);
-        const client = makeClient();
-        const r = await dex.executeSwap(client, {
+    async ({ jettonMaster, amountTon, dex: dexName, side, tier }) => {
+        log.banner("EXECUTE", `tier=${tier ?? "low"} side=${side} amount=${amountTon} TON jetton=${jettonMaster}`);
+
+        // Resolve tier (default 'low' for backward compat).
+        const resolvedTier = (tier ?? "low") as Tier;
+
+        // Route through the coordinator so kill-switch / circuit-breaker / bankroll gates fire.
+        // Bypassing the coordinator is NOT allowed — it would lose risk protection.
+        if (!isCoordinatorStarted()) {
+            return { ok: false, error: "TierCoordinator not started — boot the agent first" };
+        }
+        const coord = getCoordinator();
+
+        const r = await coord.executeForTier(resolvedTier, {
             jettonMaster,
             amountTon,
             side,
         }, dexName);
-        return r;
+        return { ...r, tier: resolvedTier };
     },
     {
         name: "execute_swap",
-        description: "Execute a real signed BUY or SELL on Ston.fi or DeDust with the hot wallet. Use ONLY after audit_jetton passes and the strategy rules are satisfied. Losses can be 100% of amountTon — verify size thrice.",
+        description: "Execute a real signed BUY or SELL on Ston.fi or DeDust through the tier coordinator. Tier 'high' requires promotion unlock. The coordinator enforces kill-switch, circuit breaker, tier position caps, and bankroll checks BEFORE signing. Losses can be 100% of amountTon — verify size thrice.",
         schema: z.object({
             jettonMaster: z.string(),
             amountTon: z.number().positive().max(50, "cap to 50 TON until risk profile grows"),
             dex: z.enum(["stonfi", "dedust"]).default(CONFIG.strategy.preferredDex),
             side: z.enum(["buy", "sell"]).default("buy"),
+            tier: z.enum(["low", "mid", "high"]).default("low")
+                .describe("Risk tier wallet to route the swap through. 'high' is promotion-gated."),
         }),
     }
 );
 
 // ─────────────────────────────── 4. JETTON META ───────────────────────────────
 export const getJettonMetaTool = tool(
-    async ({ jettonMaster }) => {
+    async ({ jettonMaster }: { jettonMaster: string }) => {
         const data = await audit.getJetton(jettonMaster);
         return data || { error: `no meta for ${jettonMaster}` };
     },
@@ -90,14 +106,11 @@ export const getJettonMetaTool = tool(
     }
 );
 
-// ─────────────────────────────── 5. JETTON PRICE ───────────────────────────────
+// ─────────────────────────────── 5. JETTON PRICE (TONAPI retry-aware) ───────────────────────────────
 export const getJettonPriceTool = tool(
-    async ({ jettonMaster }) => {
+    async ({ jettonMaster }: { jettonMaster: string }) => {
         try {
-            const r = await axios.get(
-                `${CONFIG.tonapiBase}/jettons/${jettonMaster}`,
-                { headers: { Authorization: `Bearer ${CONFIG.tonApiKey}`, "Content-Type": "application/json" }, timeout: 8000 }
-            );
+            const r = await tonapiGet(`/jettons/${jettonMaster}`, { timeoutMs: 8000 });
             const priceUsd = r.data?.market_data?.price;
             const priceBtc = r.data?.market_data?.price_btc;
             const capUsd = r.data?.market_data?.market_cap;
@@ -115,7 +128,7 @@ export const getJettonPriceTool = tool(
 
 // ─────────────────────────────── 6. WATCH JETTON (for monitoring) ───────────────────────────────
 export const watchPositionTool = tool(
-    async ({ jettonMaster }) => {
+    async ({ jettonMaster }: { jettonMaster: string }) => {
         const data = await audit.getJetton(jettonMaster);
         const priceUsd = data?.market_data?.price ?? null;
         const holders = data?.holders_count ?? 0;
@@ -128,31 +141,163 @@ export const watchPositionTool = tool(
     }
 );
 
-// ─────────────────────────────── 7. PUSH EVENT TO WEB ───────────────────────────────
+// ─────────────────────────────── 7. PUSH EVENT TO WEB (idempotent envelope) ───────────────────────────────
 export const notifyWebTool = tool(
-    async ({ kind, payload }) => {
-        const url = CONFIG.publicWebhookUrl;
-        if (!url) return { sent: false, reason: "PUBLIC_WEBHOOK_URL not set" };
-        try {
-            await axios.post(url, { kind, payload }, {
-                headers: {
-                    "Content-Type": "application/json",
-                    "X-Agent-Secret": CONFIG.agentSharedSecret,
-                },
-                timeout: 10000,
-            });
-            return { sent: true };
-        } catch (e: any) {
-            log.warn("notifyWeb", `failed ${e.message}`);
-            return { sent: false, error: e.message };
-        }
+    async ({ kind, payload }: { kind: string; payload: Record<string, any> }) => {
+        // Reuse payload.id if present so retries with same payload dedupe on
+        // the web side. Otherwise mint a fresh id.
+        const stableId = typeof payload?.id === "string" ? payload.id : undefined;
+        return await postEnvelope({
+            kind,
+          walletTier: typeof payload?.walletTier === "string" ? (payload.walletTier as Tier) : undefined,
+          payload,
+          stableId,
+        });
     },
     {
         name: "notify_web",
         description: "Push an event (radar hit, trade executed, audit complete, message) to the owned web app at PUBLIC_WEBHOOK_URL. Use this for the human-readable trail on every important decision.",
         schema: z.object({
-            kind: z.enum(["radar_hit", "trade_executed", "audit", "agent_message", "status"]),
+            kind: z.enum(["radar_hit", "trade_executed", "audit", "agent_message", "status", "position_update"]),
             payload: z.record(z.any()),
+        }),
+    }
+);
+
+// ─────────────────────────────── 8. CHECK RISK STATUS ───────────────────────────────
+// Read-only view of the kill-switch, circuit breaker, per-tier bankroll, and
+// the high-tier promotion gate. The agent should consult this BEFORE sizing
+// any new buy and after any sell.
+export const checkRiskStatusTool = tool(
+    async ({ tier }: { tier?: Tier }) => {
+        if (!isCoordinatorStarted()) {
+            return { ok: false, error: "TierCoordinator not started yet" };
+        }
+        const coord = getCoordinator();
+        const snap = coord.getSnapshot();
+        const result: any = {
+            ok: true,
+            killSwitch: snap.killSwitch,
+            circuitBreaker: snap.circuitBreaker,
+            highTierUnlocked: snap.highUnlocked,
+            uptimeSec: snap.uptimeSec,
+            tiers: snap.tiers,
+        };
+        if (tier) {
+            const handle = coord.getTierHandle(tier);
+            if (!handle) {
+                return { ok: false, error: `tier "${tier}" not initialized` };
+            }
+            // Reuse the same gate logic so the agent sees what execute_swap will check.
+            const requestedTon = CONFIG.strategy.defaultSnipeTon;
+            const gate = coord.isTradeAllowed(tier, requestedTon);
+            result.gate = gate;
+            result.tierDetail = {
+                tier,
+                balanceTon: handle.balanceTon,
+                openPositions: handle.openPositions,
+                closedTrades: handle.closedTrades,
+                dailyPnlTon: handle.dailyPnlTon,
+                maxPositionTon: handle.config.maxPositionTon,
+                maxOpen: handle.config.maxOpen,
+                stopLossPct: handle.config.stopLossPct,
+                takeProfitPct: handle.config.takeProfitPct,
+                minAiScore: handle.config.minAiScore,
+            };
+        }
+        return result;
+    },
+    {
+        name: "check_risk_status",
+        description: "Inspect risk posture: kill-switch state, circuit breaker (daily PnL), per-tier bankroll, open-position counts, and whether HIGH tier is unlocked. Pass a tier name to also see whether a default-sized buy is currently allowed for that tier. Call this BEFORE execute_swap and after any sell to confirm trading is still permitted.",
+        schema: z.object({
+            tier: z.enum(["low", "mid", "high"]).optional()
+                .describe("Optional tier to probe — returns gate verdict + risk params for that tier."),
+        }),
+    }
+);
+
+// ─────────────────────────────── 9. RECORD POSITION ───────────────────────────────
+// Persists an open position to SQLite so the position monitor can later apply
+// stop-loss / take-profit. Called by the agent IMMEDIATELY after execute_swap
+// succeeds on a buy. Sells should record a separate close via stop-loss/take-profit
+// status transitions handled by the position monitor.
+export const recordPositionTool = tool(
+    async ({
+        walletTier,
+        jettonMaster,
+        symbol,
+        dex: dexName,
+        entryTxHash,
+        entryPriceTon,
+        entryPriceUsd,
+        amountTokens,
+        costBasisTon,
+    }: {
+        walletTier: Tier;
+        jettonMaster: string;
+        symbol?: string;
+        dex?: string;
+        entryTxHash: string;
+        entryPriceTon: number;
+        entryPriceUsd?: number;
+        amountTokens: string;
+        costBasisTon: number;
+    }) => {
+        if (!isCoordinatorStarted()) {
+            return { ok: false, error: "TierCoordinator not started yet" };
+        }
+        if (!ALL_TIERS.includes(walletTier)) {
+            return { ok: false, error: `unknown tier "${walletTier}"` };
+        }
+        // Soft gate: refuse to record a buy into a tier that is currently blocked.
+        const coord = getCoordinator();
+        const gate = coord.isTradeAllowed(walletTier, costBasisTon);
+        if (!gate.allowed) {
+            log.warn("MCP", `record_position denied for ${walletTier.toUpperCase()}: ${gate.reason}`);
+            return { ok: false, error: gate.reason };
+        }
+
+        const id = newId("pos");
+        const now = Date.now();
+        const dbPos = {
+            id,
+            wallet_tier: walletTier,
+            jetton_master: jettonMaster,
+            symbol: symbol ?? null,
+            dex: dexName ?? CONFIG.strategy.preferredDex,
+            entry_tx_hash: entryTxHash,
+            entry_price_ton: entryPriceTon,
+            entry_price_usd: entryPriceUsd ?? null,
+            entry_at: now,
+            amount_tokens: amountTokens,
+            cost_basis_ton: costBasisTon,
+            status: "OPEN",
+        } as any;
+
+        try {
+            positionsStore.upsert(dbPos);
+            log.ok("MCP", `[${walletTier.toUpperCase()}] recorded OPEN position ${id} ${symbol ?? "?"} cost=${costBasisTon}TON`);
+            return { ok: true, id, position: dbPos };
+        } catch (e: any) {
+            log.err("MCP", `record_position failed: ${e.message}`);
+            return { ok: false, error: e.message };
+        }
+    },
+    {
+        name: "record_position",
+        description: "Persist a freshly executed BUY to the agent's position database so the position monitor can apply stop-loss, take-profit, and trailing exits. Call this immediately after execute_swap returns ok=true (side='buy'). The position monitor handles sells automatically.",
+        schema: z.object({
+            walletTier: z.enum(["low", "mid", "high"])
+                .describe("The risk tier wallet that holds this position — must match the tier passed to execute_swap."),
+            jettonMaster: z.string().describe("EQ... master address of the jetton bought."),
+            symbol: z.string().optional().describe("Optional display symbol (e.g. 'jTON')."),
+            dex: z.enum(["stonfi", "dedust"]).optional(),
+            entryTxHash: z.string().describe("Transaction hash returned by the DEX after the buy settled."),
+            entryPriceTon: z.number().positive().describe("TON price of the token at entry, used for PnL math."),
+            entryPriceUsd: z.number().positive().optional().describe("Optional USD price at entry (from TONAPI)."),
+            amountTokens: z.string().describe("Jetton amount in nano-jetton units as a string (BigInt-safe)."),
+            costBasisTon: z.number().positive().describe("TON actually spent on the buy, including gas."),
         }),
     }
 );

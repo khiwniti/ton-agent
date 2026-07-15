@@ -1,0 +1,35 @@
+# ====================================================================
+# .dockerignore — keep the AGENT image lean.
+# The agent runtime does NOT need the web app, build artifacts, or secrets.
+# ====================================================================
+
+# Dependencies & build output (reinstalled/rebuilt inside the image)
+node_modules
+**/node_modules
+dist
+**/dist
+.next
+**/.next
+
+# Secrets — NEVER bake into an image
+.env
+.env.*
+!.env.example
+
+# VCS & tooling
+.git
+.gitignore
+.github
+
+# Logs & local state
+*.log
+.remember
+data
+
+# The web app is deployed to Vercel — not part of the agent image
+apps/web
+
+# Misc editor / OS cruft
+.vscode
+.idea
+.DS_Store

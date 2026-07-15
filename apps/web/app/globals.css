@@ -1,0 +1,87 @@
+@import "tailwindcss";
+
+/* ─────────────────────────────────────────────────────────────
+   Design tokens — dark trading-desk aesthetic.
+   Tier colours: LOW = teal/green, MID = amber, HIGH = red.
+   ───────────────────────────────────────────────────────────── */
+@theme {
+  --color-bg: #07090c;
+  --color-bg-elev: #0d1117;
+  --color-panel: #11161d;
+  --color-border: #1e2630;
+  --color-border-strong: #2b3542;
+  --color-fg: #e6edf3;
+  --color-fg-muted: #8b98a5;
+  --color-fg-dim: #5c6773;
+
+  --color-teal: #2dd4bf;
+  --color-teal-dim: #0f766e;
+  --color-amber: #f59e0b;
+  --color-amber-dim: #92400e;
+  --color-red: #ef4444;
+  --color-red-dim: #991b1b;
+  --color-green: #22c55e;
+
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", monospace;
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+html,
+body {
+  background-color: var(--color-bg);
+  color: var(--color-fg);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Numeric / monospace utility */
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Accessible focus ring for keyboard users */
+:where(a, button, input, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-teal);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Tier accent helpers (referenced via TIER_ACCENT) */
+.tier-low {
+  --tier: var(--color-teal);
+}
+.tier-mid {
+  --tier: var(--color-amber);
+}
+.tier-high {
+  --tier: var(--color-red);
+}
+
+/* Custom scrollbar for dense data panels */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-border-strong) transparent;
+}
+.scroll-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}

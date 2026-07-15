@@ -27,6 +27,22 @@ const req = (k: string) => {
     }
     return v;
 };
+
+/**
+ * Like `req()` but tries multiple env var names in order, warns ONCE with
+ * all names when none are set. Used when a config key has been renamed but
+ * legacy env vars still work — e.g. WALLET_MASTER_MNEMONIC (new) vs.
+ * WALLET_MNEMONIC (legacy).
+ */
+const reqAny = (...keys: string[]): string => {
+    for (const k of keys) {
+        const v = process.env[k];
+        if (v && v.trim() !== "") return v;
+    }
+    // None of the keys resolved — warn once with all enumerated names.
+    console.error(`[CONFIG] ⚠ Missing one of [${keys.join(", ")}] — feature disabled.`);
+    return "";
+};
 const opt = (k: string, fb: string) => (process.env[k] && process.env[k] !== "" ? process.env[k]! : fb);
 const num = (k: string, fb: number) => {
     const v = process.env[k];
@@ -48,7 +64,7 @@ export const CONFIG = {
     ),
     tonApiKey: req("TON_API_KEY"),
     tonapiBase: opt("TONAPI_BASE", "https://tonapi.io/v2"),
-    mnemonic: req("WALLET_MNEMONIC"),
+    mnemonic: reqAny("WALLET_MASTER_MNEMONIC", "WALLET_MNEMONIC"),
     walletVersion: opt("WALLET_VERSION", "v5r1") as "v3r2" | "v4r2" | "v5r1",
     walletSubwalletId: num("WALLET_SUBWALLET_ID", 698983191),
     publicWebhookUrl: opt("PUBLIC_WEBHOOK_URL", ""),

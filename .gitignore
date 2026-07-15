@@ -28,3 +28,11 @@ probe/
 *.pem
 wallet-*.json
 mnemonic-*.txt
+
+# ---- temp / conversation logs ----
+*.txt
+!.github/**/*.txt
+!.vercelignore
+
+# ---- agent runtime data ----
+apps/agent/data/

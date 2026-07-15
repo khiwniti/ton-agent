@@ -1,0 +1,42 @@
+{
+  "name": "@ton-agent/web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Control plane + dashboard for the TON autonomous trading agent (3-wallet risk tiers).",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "deploy": "vercel deploy --prod",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@ston-fi/api": "^0.32.0",
+    "@ston-fi/sdk": "^2.7.0",
+    "@supabase/ssr": "^0.5.2",
+    "@supabase/supabase-js": "^2.47.10",
+    "@ton-agent/shared": "*",
+    "@ton/core": "^0.63.1",
+    "@ton/crypto": "^3.3.0",
+    "@tonconnect/sdk": "^3.0.0",
+    "@tonconnect/ui-react": "^2.1.0",
+    "next": "^15.2.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^20.17.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.17.0",
+    "eslint-config-next": "^15.2.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

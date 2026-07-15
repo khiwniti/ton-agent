@@ -1,0 +1,15 @@
+# ====================================================================
+# CODEOWNERS — automatic review requests
+# Docs: https://docs.github.com/articles/about-code-owners
+# Last matching pattern wins.
+# ====================================================================
+
+# Default owner for everything in the repo
+*                       @khiwniti
+
+# ── Money-touching subsystems (stricter ownership) ──────────────────
+# Any change to DEX routing, wallet signing, or risk controls MUST be
+# reviewed by @khiwniti before merge.
+apps/agent/src/dex/     @khiwniti
+apps/agent/src/wallet/  @khiwniti
+apps/agent/src/risk/    @khiwniti

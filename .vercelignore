@@ -1,0 +1,66 @@
+# ──────────────────────────────────────────────────────────────────
+# .vercelignore — apps/web-only Vercel deployment
+# ------------------------------------------------------------------
+# Vercel installs from the repo root (so workspaces resolve). We upload
+# only what's actually needed to build the web app. Keeping this small
+# cuts install time + bundle size + accidental secret inclusion.
+#
+# IMPORTANT: `packages/shared/` MUST be uploaded — Next's
+# `transpilePackages: ["@ton-agent/shared"]` reads it as raw TypeScript
+# (package.json `main` points to ./src/index.ts). Excluding `packages/`
+# breaks the build with a "Cannot find module @ton-agent/shared" error.
+# ──────────────────────────────────────────────────────────────────
+
+# Agent workspace — never deployed here. ALWAYS ignored.
+apps/agent
+apps/agent/**
+
+# Keep apps/web/supabase/ — migrations are useful as a deploy reference
+# (committed alongside the schema that the agent will consume via REST/RPC).
+
+# Secrets / local state — MUST never reach Vercel.
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Build artefacts (Vercel rebuilds everything).
+.next
+**/.next
+**/dist
+**/build
+**/coverage
+out
+
+# Dependencies — installed fresh by Vercel.
+node_modules
+**/node_modules
+
+# Local data, logs, OS junk.
+*.log
+.DS_Store
+**/*.log
+**/.DS_Store
+
+# Vercel + git metadata.
+.vercel
+.git
+.github
+
+# Tooling docs that aren't part of the web bundle.
+*.txt
+
+# Dockerfile / docker-compose are for the agent runtime, not the web build.
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Editor / Claude / authoring leftovers.
+.claude
+.agents
+
+# NOTE: packages/shared/ is INTENTIONALLY NOT excluded. Its raw
+# TypeScript source under packages/shared/src/* is required by
+# apps/web/next.config.ts's `transpilePackages` setting.
