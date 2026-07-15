@@ -90,4 +90,22 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-CMD ["node", "apps/agent/dist/index.js"]
+# Startup diagnostic — verify @ston-fi/api availability before agent boot.
+# The build confirms it's in the image, but runtime resolution may differ.
+CMD node -e "\
+  try {\
+    var p = require.resolve('@ston-fi/api');\
+    console.log('[STARTUP] @ston-fi/api resolved to:', p);\
+  } catch(e) {\
+    console.log('[STARTUP] @ston-fi/api RESOLVE FAIL:', e.message);\
+    console.log('[STARTUP] Attempting fallback install...');\
+    require('child_process').execSync('npm install @ston-fi/api@0.32.0 --legacy-peer-deps --no-save', { cwd: '/app' });\
+    try {\
+      p = require.resolve('@ston-fi/api');\
+      console.log('[STARTUP] @ston-fi/api resolved after fallback to:', p);\
+    } catch(e2) {\
+      console.log('[STARTUP] @ston-fi/api STILL FAILS after fallback:', e2.message);\
+    }\
+  }\
+  console.log('[STARTUP] Booting agent...');\
+" && node apps/agent/dist/index.js
