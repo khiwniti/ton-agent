@@ -1,0 +1,56 @@
+# fly.toml — TON Agent Runtime
+#
+# Deploy from repo root:  fly deploy
+# Set secrets:            fly secrets set KEY=VAL
+# Create volume:          fly volumes create ton_agent_data --size 1
+# View logs:              fly logs
+#
+# The agent is a long-running process (not a web server). The [[services]]
+# block below is OPTIONAL — it enables Fly's health checks against the
+# /healthz endpoint. If you don't need health checks, remove the whole
+# [[services]] section and the app runs as a worker (no public port).
+
+app = "ton-agent"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  # DATA_DIR must match the volume mount destination below.
+  DATA_DIR = "/app/data"
+
+# Persistent volume for SQLite database.
+# Create once:  fly volumes create ton_agent_data --size 1 --region ord
+[mounts]
+  source = "ton_agent_data"
+  destination = "/app/data"
+
+# ── Optional: health-check service ────────────────────────────
+# The agent exposes GET /healthz on the port set via HEALTH_PORT
+# (or $PORT on Fly.io). Remove the whole [[services]] block if you
+# only want a worker (no health checks, no public port).
+[[services]]
+  protocol = "tcp"
+  internal_port = 8080
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 10
+
+  # Grace period before health checks start (agent needs ~20s to boot).
+  [[services.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    method = "GET"
+    path = "/healthz"
+    timeout = "5s"
