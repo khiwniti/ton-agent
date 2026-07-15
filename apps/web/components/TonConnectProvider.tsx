@@ -28,10 +28,17 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
     process.env.NEXT_PUBLIC_TONCONNECT_MANIFEST_URL ||
     `${DEFAULT_APP_URL.replace(/\/$/, "")}/tonconnect-manifest.json`;
 
+  // Explicit bridge URL ensures the QR-code (universal) flow uses a bridge
+  // that's already in our CSP connect-src. Without this, the SDK probes
+  // every registered wallet bridge and gets blocked by CSP for the ones
+  // we haven't whitelisted, leaving the user stuck on "Awaiting wallet".
+  //
+  // Tonkeeper's bridge is the most reliable and already whitelisted.
   // v2.4.4's provider types don't always include bridgeUrl/preferences.
   // Cast to `any` so the runtime is correct while the type surface stabilises.
   const providerProps = {
     manifestUrl,
+    bridgeUrl: "https://bridge.tonapi.io/bridge",
     preferences: { theme: "DARK" },
   } as any;
 
