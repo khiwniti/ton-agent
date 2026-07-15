@@ -71,10 +71,11 @@ RUN apt-get update \
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/apps/agent/dist ./apps/agent/dist
 COPY --from=builder /app/apps/agent/package.json ./apps/agent/package.json
+COPY --from=builder /app/packages/shared/dist /app/packages/shared/dist
 COPY --from=builder /app/package.json ./package.json
 
 # SQLite lives here; mount a volume over it in production (see compose).
-RUN mkdir -p /app/data && mkdir -p /app/packages/shared/dist && chown -R node:node /app
+RUN mkdir -p /app/data && chown -R node:node /app
 
 # Drop privileges.
 USER node
