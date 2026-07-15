@@ -91,7 +91,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
 # We must override BOTH package.json files to point at the compiled JS.
 RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
     > /app/packages/shared/package.json && \
-    printf '{"name":"@ton-agent/shared","main":"../packages/shared/dist/index.js","types":"../packages/shared/dist/index.d.ts","private":true}' \
+    printf '{"name":"@ton-agent/shared","main":"../../../packages/shared/dist/index.js","types":"../../../packages/shared/dist/index.d.ts","private":true}' \
     > /app/node_modules/@ton-agent/shared/package.json && \
     node -e "require('@ton-agent/shared'); console.log('[RUNTIME] @ton-agent/shared OK');"
 
