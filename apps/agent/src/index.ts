@@ -124,7 +124,10 @@ async function main() {
     // 8. Local /healthz server (loopback-only). Surfaced for uptime checks
     //    and to expose a plain snapshot for ops dashboards. Disabled unless
     //    HEALTH_PORT is set.
-    const HEALTH_PORT = Number(process.env.HEALTH_PORT || 0);
+    // Railway assigns a dynamic $PORT env var. If HEALTH_PORT isn't set
+    // explicitly, fall back to $PORT so the health server binds to the
+    // port Railway expects (and its platform health checks can reach it).
+    const HEALTH_PORT = Number(process.env.HEALTH_PORT || process.env.PORT || 0);
     if (HEALTH_PORT > 0) {
         const http = await import("node:http");
         const server = http.createServer((req, res) => {
