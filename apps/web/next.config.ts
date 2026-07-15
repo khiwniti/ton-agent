@@ -18,7 +18,7 @@ const csp = [
   "img-src 'self' data: https:",
   "font-src 'self' data:",
   // PostgREST + Realtime over Supabase subdomains.
-  "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://config.ton.org https://analytics.ton.org https://bridge.tonapi.io https://broker.ton.org wss://bridge.tonapi.io",
+  "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://config.ton.org https://analytics.ton.org https://bridge.tonapi.io https://broker.ton.org wss://bridge.tonapi.io https://tonconnectbridge.mytonwallet.org https://connect.tonhubapi.com",
   "frame-ancestors 'none'",
   "base-uri 'self'",
   "form-action 'self'",
