@@ -61,12 +61,14 @@ async function getRecentJettonMasters(
       timeoutMs: 8000,
     });
     const items: TonapiJetton[] = (r.data?.jettons ?? []) as TonapiJetton[];
-    return items.map((x) => ({
-      master: x.address,
-      pool: x.pool?.pool_address,
-      symbol: x.metadata?.symbol,
-      liquidityTon: x.pool?.liquidity?.jetton_reserves_in_ton,
-    }));
+    return items
+      .filter((x): x is TonapiJetton => x != null && !!x.address)
+      .map((x) => ({
+        master: x.address,
+        pool: x.pool?.pool_address,
+        symbol: x.metadata?.symbol,
+        liquidityTon: x.pool?.liquidity?.jetton_reserves_in_ton,
+      }));
   } catch (e: any) {
     log.err("RADAR", `getRecentJettonMasters ${e.message}`);
     return [];

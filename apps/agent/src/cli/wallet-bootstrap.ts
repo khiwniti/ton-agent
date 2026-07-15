@@ -15,6 +15,7 @@
  */
 import "dotenv/config";
 import { log } from "../logger";
+import "../skills"; // side-effect import — registers all skills before invoke
 import { listSkills, invokeSkill, type SkillContext } from "../skills/runtime";
 
 function parseArgs(argv: string[]): { tier: "low" | "mid" | "high"; network: "mainnet" | "testnet"; releaseMnemonic: boolean; verifyDeploy: boolean } {

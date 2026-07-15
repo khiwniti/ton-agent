@@ -26,9 +26,7 @@ COPY packages/shared/package.json ./packages/shared/package.json
 # Force-install @ston-fi/api since @ston-fi/sdk lists it as a peer dep
 # and peer deps are not auto-installed with --legacy-peer-deps.
 RUN npm install --legacy-peer-deps && \
-    npm install @ston-fi/api@0.32.0 --legacy-peer-deps && \
-    ls /app/node_modules/@ston-fi/ && \
-    node -e "try { require('@ston-fi/api'); console.log('[BUILD] @ston-fi/api OK'); } catch(e) { console.log('[BUILD] @ston-fi/api FAIL:', e.message); }"
+    npm install @ston-fi/api@0.32.0 --legacy-peer-deps
 
 # Copy the sources needed to build packages.
 COPY packages/shared ./packages/shared
@@ -42,8 +40,7 @@ RUN npm --workspace packages/shared run build && \
 # Prune dev dependencies to slim what we carry into runtime.
 # NOTE: @ston-fi/api is intentionally kept as a production dependency
 # by virtue of being added to both root and workspace package.json.
-RUN npm prune --omit=dev --legacy-peer-deps && \
-    node -e "try { require('@ston-fi/api'); console.log('[BUILD] @ston-fi/api still OK after prune'); } catch(e) { console.log('[BUILD CRITICAL] @ston-fi/api PRUNED:', e.message); }"
+RUN npm prune --omit=dev --legacy-peer-deps
 
 # --------------------------------------------------------------------
 # Stage 2: runtime — lean, non-root
@@ -65,13 +62,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # Bring over the compiled output and production node_modules.
-# NOTE: packages/shared/ source is NOT copied — only the compiled dist/
-# output is injected below into the agent's node_modules. This prevents
-# any accidental TypeScript source resolution at runtime.
+# NOTE: packages/shared/ source is intentionally excluded — only the
+# compiled dist/ output is injected into node_modules below.
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/apps/agent/dist ./apps/agent/dist
 COPY --from=builder /app/apps/agent/package.json ./apps/agent/package.json
-COPY --from=builder /app/packages/shared/dist /app/packages/shared/dist
 COPY --from=builder /app/package.json ./package.json
 
 # SQLite lives here; mount a volume over it in production (see compose).
@@ -87,27 +82,13 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# Inject the compiled shared dist directly into the node_modules as a
-# standalone package. The shared source (src/) is intentionally NOT in
-# the runtime image — the ONLY way to resolve @ton-agent/shared is via
-# the compiled dist/index.js through the injected symlink below.
+# Inject the compiled shared dist into node_modules as a standalone
+# package. The source (src/) is intentionally NOT in the runtime image.
 COPY --from=builder /app/packages/shared/dist /app/packages/shared/dist
-RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
+RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","private":true}' \
     > /app/packages/shared/package.json && \
     rm -rf /app/node_modules/@ton-agent/shared && \
     ln -s ../../packages/shared /app/node_modules/@ton-agent/shared && \
     node -e "require('@ton-agent/shared'); console.log('[RUNTIME] @ton-agent/shared OK');"
 
-# Diagnostic CMD: verify the shared module, list what's there, then boot.
-CMD node -e "\
-  console.log('[DIAG] Starting diagnostic...');\
-  try {\
-    var r = require.resolve('@ton-agent/shared');\
-    var m = require('@ton-agent/shared');\
-    console.log('[DIAG] @ton-agent/shared resolved:', r);\
-    console.log('[DIAG] @ton-agent/shared exports:', Object.keys(m).join(', '));\
-  } catch(e) {\
-    console.log('[DIAG] @ton-agent/shared FAIL:', e.message);\
-  }\
-  console.log('[DIAG] Now booting agent...');\
-" 2>&1 && ls /app/packages/shared/src 2>&1 || echo '[DIAG] shared/src/ NOT FOUND (good)' && exec node apps/agent/dist/index.js
+CMD ["node", "apps/agent/dist/index.js"]
