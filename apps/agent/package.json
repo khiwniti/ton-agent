@@ -40,7 +40,8 @@
     "dotenv": "^16.4.5",
     "langchain": "^1.5.0",
     "ws": "^8.18.0",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "tsx": "^4.23.1"
   },
   "optionalDependencies": {
     "teleton": "^0.10.0"
@@ -50,7 +51,6 @@
     "@types/node": "^25.9.2",
     "@types/ws": "^8.5.13",
     "ts-node": "^10.9.2",
-    "tsx": "^4.23.1",
     "typescript": "^6.0.3"
   }
 }

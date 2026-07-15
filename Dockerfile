@@ -30,12 +30,14 @@ RUN npm install --legacy-peer-deps && \
     ls /app/node_modules/@ston-fi/ && \
     node -e "try { require('@ston-fi/api'); console.log('[BUILD] @ston-fi/api OK'); } catch(e) { console.log('[BUILD] @ston-fi/api FAIL:', e.message); }"
 
-# Copy the sources needed to build the agent.
-COPY apps/agent ./apps/agent
+# Copy the sources needed to build packages.
 COPY packages/shared ./packages/shared
+COPY apps/agent ./apps/agent
 
-# Compile the agent runtime (tsc → apps/agent/dist).
-RUN npm --workspace apps/agent run build
+# Build the shared package first (its JS output is required by the agent).
+# Then compile the agent runtime (tsc → apps/agent/dist).
+RUN npm --workspace packages/shared run build && \
+    npm --workspace apps/agent run build
 
 # Prune dev dependencies to slim what we carry into runtime.
 # NOTE: @ston-fi/api is intentionally kept as a production dependency
@@ -70,13 +72,6 @@ COPY --from=builder /app/apps/agent/package.json ./apps/agent/package.json
 COPY --from=builder /app/packages/shared ./packages/shared
 COPY --from=builder /app/package.json ./package.json
 
-# Re-assert @ston-fi/api in runtime — it is a peer dependency of
-# @ston-fi/sdk and may not survive the multi-stage COPY layer.
-RUN ls /app/node_modules/@ston-fi/ 2>&1 && \
-    node -e "try { require('@ston-fi/api'); console.log('[RUNTIME] @ston-fi/api available from build'); } catch(e) { console.log('[RUNTIME] @ston-fi/api missing, forcing install...'); }" && \
-    (node -e "require('@ston-fi/api')" 2>/dev/null || npm install @ston-fi/api@0.32.0 --legacy-peer-deps --no-save) && \
-    node -e "try { require('@ston-fi/api'); console.log('[RUNTIME] @ston-fi/api OK'); } catch(e) { console.log('[RUNTIME CRITICAL] @ston-fi/api FAIL:', e.message); }"
-
 # SQLite lives here; mount a volume over it in production (see compose).
 RUN mkdir -p /app/data && chown -R node:node /app
 
@@ -90,22 +85,9 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# Startup diagnostic — verify @ston-fi/api availability before agent boot.
-# The build confirms it's in the image, but runtime resolution may differ.
-CMD node -e "\
-  try {\
-    var p = require.resolve('@ston-fi/api');\
-    console.log('[STARTUP] @ston-fi/api resolved to:', p);\
-  } catch(e) {\
-    console.log('[STARTUP] @ston-fi/api RESOLVE FAIL:', e.message);\
-    console.log('[STARTUP] Attempting fallback install...');\
-    require('child_process').execSync('npm install @ston-fi/api@0.32.0 --legacy-peer-deps --no-save', { cwd: '/app' });\
-    try {\
-      p = require.resolve('@ston-fi/api');\
-      console.log('[STARTUP] @ston-fi/api resolved after fallback to:', p);\
-    } catch(e2) {\
-      console.log('[STARTUP] @ston-fi/api STILL FAILS after fallback:', e2.message);\
-    }\
-  }\
-  console.log('[STARTUP] Booting agent...');\
-" && node apps/agent/dist/index.js
+# The shared package ships raw TypeScript (main -> ./src/index.ts) so
+# --require tsx registers a TypeScript loader that transpiles .ts files
+# on the fly when Node encounters them via require().
+ENV NODE_OPTIONS="--require tsx"
+
+CMD ["node", "apps/agent/dist/index.js"]
