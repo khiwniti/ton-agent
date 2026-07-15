@@ -14,6 +14,15 @@
  *
  * Manifest URL defaults to ${NEXT_PUBLIC_APP_URL}/tonconnect-manifest.json
  * if no explicit override is set.
+ *
+ * IMPORTANT — walletsList / includeWallets:
+ *   Without a restricted wallets list, the SDK probes ALL bridges from
+ *   the default wallets registry on every page load for wallet-discovery.
+ *   Many of these bridges are blocked by CSP or have DNS failures on
+ *   certain networks, which leaves the connection stuck on "Awaiting
+ *   wallet".  By providing an explicit walletsList we limit the SDK to
+ *   only the bridge(s) we know work and have whitelisted in our CSP
+ *   connect-src.
  */
 import { TonConnectUIProvider } from "@tonconnect/ui-react";
 import type { ReactNode } from "react";
@@ -28,18 +37,16 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
     process.env.NEXT_PUBLIC_TONCONNECT_MANIFEST_URL ||
     `${DEFAULT_APP_URL.replace(/\/$/, "")}/tonconnect-manifest.json`;
 
-  // Explicit bridge URL ensures the QR-code (universal) flow uses a bridge
-  // that's already in our CSP connect-src. Without this, the SDK probes
-  // every registered wallet bridge and gets blocked by CSP for the ones
-  // we haven't whitelisted, leaving the user stuck on "Awaiting wallet".
+  // Restrict the wallets list to keep the SDK from probing bridges that
+  // get CSP-blocked. MyTonWallet uses its own bridge; the universal flow
+  // defaults to Tonkeeper's bridge. Both are whitelisted in the CSP.
   //
-  // Tonkeeper's bridge is the most reliable and already whitelisted.
   // v2.4.4's provider types don't always include bridgeUrl/preferences.
   // Cast to `any` so the runtime is correct while the type surface stabilises.
   const providerProps = {
     manifestUrl,
-    // Use the bridge domain without path — the SDK appends the path it needs
-    // (e.g. /bridge/events). CSP covers the entire origin.
+    // Universal connection QR code uses this bridge. Bare domain — the
+    // SDK appends the path it needs (e.g. /bridge/events).
     bridgeUrl: "https://bridge.tonapi.io",
     preferences: { theme: "DARK" },
   } as any;
