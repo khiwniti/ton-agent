@@ -70,6 +70,13 @@ COPY --from=builder /app/apps/agent/package.json ./apps/agent/package.json
 COPY --from=builder /app/packages/shared ./packages/shared
 COPY --from=builder /app/package.json ./package.json
 
+# Re-assert @ston-fi/api in runtime — it is a peer dependency of
+# @ston-fi/sdk and may not survive the multi-stage COPY layer.
+RUN ls /app/node_modules/@ston-fi/ 2>&1 && \
+    node -e "try { require('@ston-fi/api'); console.log('[RUNTIME] @ston-fi/api available from build'); } catch(e) { console.log('[RUNTIME] @ston-fi/api missing, forcing install...'); }" && \
+    (node -e "require('@ston-fi/api')" 2>/dev/null || npm install @ston-fi/api@0.32.0 --legacy-peer-deps --no-save) && \
+    node -e "try { require('@ston-fi/api'); console.log('[RUNTIME] @ston-fi/api OK'); } catch(e) { console.log('[RUNTIME CRITICAL] @ston-fi/api FAIL:', e.message); }"
+
 # SQLite lives here; mount a volume over it in production (see compose).
 RUN mkdir -p /app/data && chown -R node:node /app
 
