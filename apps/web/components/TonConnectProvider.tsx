@@ -38,7 +38,9 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
   // Cast to `any` so the runtime is correct while the type surface stabilises.
   const providerProps = {
     manifestUrl,
-    bridgeUrl: "https://bridge.tonapi.io/bridge",
+    // Use the bridge domain without path — the SDK appends the path it needs
+    // (e.g. /bridge/events). CSP covers the entire origin.
+    bridgeUrl: "https://bridge.tonapi.io",
     preferences: { theme: "DARK" },
   } as any;
 
