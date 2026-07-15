@@ -85,13 +85,14 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# Recreate the workspace symlink for @ton-agent/shared (Docker COPY may
-# resolve or preserve symlinks depending on builder version). Then override
-# the shared package's main field to use the compiled JS output.
+# Inject the compiled shared package directly into node_modules.
+# This avoids Docker COPY symlink resolution issues and chown/perms
+# edge cases with workspace symlinks at runtime under USER node.
 RUN rm -rf /app/node_modules/@ton-agent/shared && \
-    ln -s ../../packages/shared /app/node_modules/@ton-agent/shared && \
-    printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
-    > /app/packages/shared/package.json && \
+    mkdir -p /app/node_modules/@ton-agent/shared && \
+    cp -r /app/packages/shared/dist/* /app/node_modules/@ton-agent/shared/ && \
+    printf '{"name":"@ton-agent/shared","main":"./index.js","types":"./index.d.ts","private":true}' \
+    > /app/node_modules/@ton-agent/shared/package.json && \
     node -e "require('@ton-agent/shared'); console.log('[RUNTIME] @ton-agent/shared OK');"
 
 CMD ["node", "apps/agent/dist/index.js"]
