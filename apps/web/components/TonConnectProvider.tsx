@@ -7,15 +7,14 @@
  * would crash a Server Component render. Mounting it inside a "use client"
  * boundary keeps it lazy-loaded on the browser only.
  *
- * IMPORTANT — walletsListConfiguration / walletsListSource:
- *   Without a restricted wallets list, the SDK fetches the DEFAULT wallet
- *   registry from https://wallet.ton.org/wallets.json on every page load,
- *   then probes EVERY bridge in the registry for wallet-discovery.  Many
- *   of those bridges are blocked by CSP or have DNS failures on certain
- *   networks, which leaves the connection stuck on "Awaiting wallet".
- *   By providing an explicit walletsListSource (pointing to our manifest)
- *   and includeWallets we LIMIT the SDK to only the wallet(s) we know
- *   work and have whitelisted in our CSP connect-src.
+ * IMPORTANT — walletsListConfiguration:
+ *   Without a restricted wallets list, the SDK probes ALL bridges from the
+ *   default wallet registry (fetched from wallet.ton.org) for wallet-discovery
+ *   on every page load.  Many of those bridges are blocked by CSP or have DNS
+ *   failures on certain networks, which leaves connections stuck on "Awaiting
+ *   wallet".  By providing an explicit includeWallets list we ensure our two
+ *   preferred wallets (Tonkeeper + MyTonWallet) are present and discoverable,
+ *   even if the default registry probes still fire in the background.
  */
 import { TonConnectUIProvider } from "@tonconnect/ui-react";
 import type { ReactNode } from "react";
@@ -30,22 +29,17 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
     process.env.NEXT_PUBLIC_TONCONNECT_MANIFEST_URL ||
     `${DEFAULT_APP_URL.replace(/\/$/, "")}/tonconnect-manifest.json`;
 
-  // Hard-restrict the wallet list to ONLY the bridges we've whitelisted
-  // in the CSP.  By pointing walletsListSource at our own manifest URL
-  // the SDK will NOT fetch the default wallet registry, which eliminates
-  // the CSP-blocked bridge probes that were causing the "awaiting wallet"
-  // deadlock.
-  const options = {
+  // v2.4.4 — TonConnectUIProvider accepts direct props.
+  // walletsListConfiguration.includeWallets adds wallets on top of the
+  // default registry; we cast to any because extra fields like jsBridgeKey
+  // are not in the v2.4.4 type surface but are recognised at runtime.
+  const providerProps = {
     manifestUrl,
-    // Universal connection QR code uses this bridge. Bare domain — the
-    // SDK appends the path it needs (e.g. /bridge/events).
-    bridgeUrl: "https://bridge.tonapi.io",
     walletsListConfiguration: {
-      // Point to our own manifest so the SDK skips the default registry
-      walletsListSource: manifestUrl,
       includeWallets: [
         {
           name: "Tonkeeper",
+          appName: "tonkeeper",
           imageUrl: "https://tonkeeper.com/assets/tonconnect-icon.png",
           aboutUrl: "https://tonkeeper.com",
           bridgeUrl: "https://bridge.tonapi.io",
@@ -53,19 +47,22 @@ export function TonConnectProvider({ children }: { children: ReactNode }) {
         },
         {
           name: "MyTonWallet",
+          appName: "mytonwallet",
           imageUrl: "https://mytonwallet.io/icon-192.png",
           aboutUrl: "https://mytonwallet.io",
           bridgeUrl: "https://tonconnectbridge.mytonwallet.org/bridge/",
           universalLink: "https://connect.mytonwallet.org",
+          // jsBridgeKey tells the SDK to check window.mytonwallet for the
+          // browser extension's JS Bridge (extension detection).
           jsBridgeKey: "mytonwallet",
         },
       ],
     },
-    preferences: { theme: "DARK" },
+    uiPreferences: { theme: "DARK" },
   } as any;
 
   return (
-    <TonConnectUIProvider options={options}>
+    <TonConnectUIProvider {...providerProps}>
       {children}
     </TonConnectUIProvider>
   );
