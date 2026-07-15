@@ -85,7 +85,11 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# The shared package ships raw TypeScript (main -> ./src/index.ts), so
-# we use tsx as the runtime — it handles transpilation of .ts files that
-# are required() from compiled JS modules. tsx is a regular dependency.
-CMD ["/app/node_modules/.bin/tsx", "apps/agent/dist/index.js"]
+# Override the shared package's main field so Node resolves to the
+# compiled JS output instead of raw TypeScript source. The web app
+# keeps the original main: ./src/index.ts for its own build.
+RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
+    > /app/packages/shared/package.json && \
+    node -e "require('@ton-agent/shared'); console.log('[RUNTIME] @ton-agent/shared OK');"
+
+CMD ["node", "apps/agent/dist/index.js"]
