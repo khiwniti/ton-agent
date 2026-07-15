@@ -85,14 +85,13 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# The builder's npm install creates node_modules/@ton-agent/shared as a
-# workspace symlink pointing to packages/shared/. Docker COPY resolves
-# symlinks by default, so the runtime gets TWO COPIES of the raw source.
-# We must override BOTH package.json files to point at the compiled JS.
-RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
+# Recreate the workspace symlink for @ton-agent/shared (Docker COPY may
+# resolve or preserve symlinks depending on builder version). Then override
+# the shared package's main field to use the compiled JS output.
+RUN rm -rf /app/node_modules/@ton-agent/shared && \
+    ln -s ../../packages/shared /app/node_modules/@ton-agent/shared && \
+    printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
     > /app/packages/shared/package.json && \
-    printf '{"name":"@ton-agent/shared","main":"../../../packages/shared/dist/index.js","types":"../../../packages/shared/dist/index.d.ts","private":true}' \
-    > /app/node_modules/@ton-agent/shared/package.json && \
     node -e "require('@ton-agent/shared'); console.log('[RUNTIME] @ton-agent/shared OK');"
 
 CMD ["node", "apps/agent/dist/index.js"]
