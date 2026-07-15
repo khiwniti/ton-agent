@@ -36,3 +36,4 @@ mnemonic-*.txt
 
 # ---- agent runtime data ----
 apps/agent/data/
+.vercel
