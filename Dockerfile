@@ -23,7 +23,12 @@ COPY apps/agent/package.json ./apps/agent/package.json
 COPY packages/shared/package.json ./packages/shared/package.json
 
 # Workspace install (Termux/Android peer-dep quirks → legacy resolver).
-RUN npm install --legacy-peer-deps
+# Force-install @ston-fi/api since @ston-fi/sdk lists it as a peer dep
+# and peer deps are not auto-installed with --legacy-peer-deps.
+RUN npm install --legacy-peer-deps && \
+    npm install @ston-fi/api@0.32.0 --legacy-peer-deps && \
+    ls /app/node_modules/@ston-fi/ && \
+    node -e "try { require('@ston-fi/api'); console.log('[BUILD] @ston-fi/api OK'); } catch(e) { console.log('[BUILD] @ston-fi/api FAIL:', e.message); }"
 
 # Copy the sources needed to build the agent.
 COPY apps/agent ./apps/agent
@@ -33,7 +38,10 @@ COPY packages/shared ./packages/shared
 RUN npm --workspace apps/agent run build
 
 # Prune dev dependencies to slim what we carry into runtime.
-RUN npm prune --omit=dev --legacy-peer-deps
+# NOTE: @ston-fi/api is intentionally kept as a production dependency
+# by virtue of being added to both root and workspace package.json.
+RUN npm prune --omit=dev --legacy-peer-deps && \
+    node -e "try { require('@ston-fi/api'); console.log('[BUILD] @ston-fi/api still OK after prune'); } catch(e) { console.log('[BUILD CRITICAL] @ston-fi/api PRUNED:', e.message); }"
 
 # --------------------------------------------------------------------
 # Stage 2: runtime — lean, non-root
