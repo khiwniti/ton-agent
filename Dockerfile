@@ -88,4 +88,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
 # The shared package ships raw TypeScript (main -> ./src/index.ts), so
 # we use tsx as the runtime — it handles transpilation of .ts files that
 # are required() from compiled JS modules. tsx is a regular dependency.
-CMD ["tsx", "apps/agent/dist/index.js"]
+CMD ["/app/node_modules/.bin/tsx", "apps/agent/dist/index.js"]
