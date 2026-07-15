@@ -85,9 +85,7 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# The shared package ships raw TypeScript (main -> ./src/index.ts) so
-# --require tsx registers a TypeScript loader that transpiles .ts files
-# on the fly when Node encounters them via require().
-ENV NODE_OPTIONS="--require tsx"
-
-CMD ["node", "apps/agent/dist/index.js"]
+# The shared package ships raw TypeScript (main -> ./src/index.ts), so
+# we use tsx as the runtime — it handles transpilation of .ts files that
+# are required() from compiled JS modules. tsx is a regular dependency.
+CMD ["tsx", "apps/agent/dist/index.js"]
