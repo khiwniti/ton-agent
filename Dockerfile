@@ -87,9 +87,10 @@ EXPOSE 9090
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
 
-# Inject the compiled shared dist directly into the agent's node_modules
-# as a standalone package. The shared source (src/) is intentionally NOT
-# in the runtime image, preventing any accidental .ts file resolution.
+# Inject the compiled shared dist directly into the node_modules as a
+# standalone package. The shared source (src/) is intentionally NOT in
+# the runtime image — the ONLY way to resolve @ton-agent/shared is via
+# the compiled dist/index.js through the injected symlink below.
 COPY --from=builder /app/packages/shared/dist /app/packages/shared/dist
 RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist/index.d.ts","private":true}' \
     > /app/packages/shared/package.json && \
@@ -97,4 +98,16 @@ RUN printf '{"name":"@ton-agent/shared","main":"./dist/index.js","types":"./dist
     ln -s ../../packages/shared /app/node_modules/@ton-agent/shared && \
     node -e "require('@ton-agent/shared'); console.log('[RUNTIME] @ton-agent/shared OK');"
 
-CMD ["node", "apps/agent/dist/index.js"]
+# Diagnostic CMD: verify the shared module, list what's there, then boot.
+CMD node -e "\
+  console.log('[DIAG] Starting diagnostic...');\
+  try {\
+    var r = require.resolve('@ton-agent/shared');\
+    var m = require('@ton-agent/shared');\
+    console.log('[DIAG] @ton-agent/shared resolved:', r);\
+    console.log('[DIAG] @ton-agent/shared exports:', Object.keys(m).join(', '));\
+  } catch(e) {\
+    console.log('[DIAG] @ton-agent/shared FAIL:', e.message);\
+  }\
+  console.log('[DIAG] Now booting agent...');\
+" 2>&1 && ls /app/packages/shared/src 2>&1 || echo '[DIAG] shared/src/ NOT FOUND (good)' && exec node apps/agent/dist/index.js
