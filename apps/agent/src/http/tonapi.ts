@@ -68,7 +68,9 @@ export async function tonapiGet(path: string, opts: TonapiGetOpts = {}): Promise
   const timeout = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxAttempts = opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
   const headers: Record<string, string> = { "Content-Type": "application/json", ...(opts.headers ?? {}) };
-  if (CONFIG.tonApiKey) headers.Authorization = `Bearer ${CONFIG.tonApiKey}`;
+  // TONAPI (tonapi.io) requires its own key from tonconsole.com.
+  // The TON_API_KEY env var is for TonCenter RPC, not TONAPI.
+  // Anonymous TONAPI access works for free-tier endpoints (rate-limited).
 
   let lastErr: unknown = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
