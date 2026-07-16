@@ -32,6 +32,7 @@ import {
   TIER_RISK_CONFIGS,
   DAILY_LOSS_LIMIT_TON,
 } from "../risk/guardrails";
+import { postEnvelope } from "../webhook";
 
 // Pure-types + gate evaluator live in `gate.ts` (no side effects).
 // The live coordinator carries runtime-only fields (kp/address) on top
@@ -401,7 +402,7 @@ class TierCoordinator {
         handle.closedTrades = positionsStore.countClosedForTier(tier);
         handle.dailyPnlTon = dailyPnlStore.getTodayPnl();
 
-        statusStore.upsert({
+        const statusRow = {
           tier,
           status: this.state.killSwitchActive
             ? "KILLED"
@@ -418,7 +419,25 @@ class TierCoordinator {
           daily_pnl_ton: handle.dailyPnlTon,
           uptime_sec: uptimeSec,
           updated_at: Date.now(),
-        });
+        };
+
+        statusStore.upsert(statusRow);
+
+        // Push status to web app so the dashboard shows live balances.
+        postEnvelope({
+          kind: "status",
+          walletTier: tier,
+          payload: {
+            status: statusRow.status,
+            startedAt: this.state.startedAt,
+            bankrollTon: handle.balanceTon,
+            openPositions: handle.openPositions,
+            totalPnLTon: handle.totalPnlTon,
+            uptimeSec: Math.floor(uptimeSec),
+            version: "1.0.0",
+          },
+          stableId: `status-${tier}`,  // fixed stableId so Supabase upsert overwrites the same row
+        }).catch(() => {}); // fire-and-forget
       } catch (e: any) {
         log.debug("COORD", `[${tier.toUpperCase()}] status refresh failed: ${e.message}`);
       }

@@ -108,6 +108,7 @@ async function main() {
     }
 
     // 7. Headline heartbeat — periodic one-line status, very cheap.
+    // Also pushes a status snapshot to the web app dashboard.
     if (isCoordinatorStarted()) {
         const hb = setInterval(() => {
             if (shuttingDown || !isCoordinatorStarted()) return;
@@ -117,6 +118,7 @@ async function main() {
                 `up=${Math.floor(s.uptimeSec)}s cb=${s.circuitBreaker.ok ? "ok" : "TRIPPED"} kill=${s.killSwitch.active ? "ON" : "off"} ` +
                     s.tiers.map((t) => `${t.tier.toUpperCase()}=${t.balanceTon.toFixed(2)}T/${t.openPositions}o`).join(" "),
             );
+
         }, 60_000);
         loops.push({ name: "heartbeat", clear: () => clearInterval(hb) });
     }
