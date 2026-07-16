@@ -233,6 +233,7 @@ export const recordPositionTool = tool(
         entryPriceUsd,
         amountTokens,
         costBasisTon,
+        confidenceScore,
     }: {
         walletTier: Tier;
         jettonMaster: string;
@@ -243,6 +244,7 @@ export const recordPositionTool = tool(
         entryPriceUsd?: number;
         amountTokens: string;
         costBasisTon: number;
+        confidenceScore?: number;
     }) => {
         if (!isCoordinatorStarted()) {
             return { ok: false, error: "TierCoordinator not started yet" };
@@ -272,6 +274,7 @@ export const recordPositionTool = tool(
             entry_at: now,
             amount_tokens: amountTokens,
             cost_basis_ton: costBasisTon,
+            confidence_score: confidenceScore ?? 0,
             status: "OPEN",
         } as any;
 
@@ -298,6 +301,8 @@ export const recordPositionTool = tool(
             entryPriceUsd: z.number().positive().optional().describe("Optional USD price at entry (from TONAPI)."),
             amountTokens: z.string().describe("Jetton amount in nano-jetton units as a string (BigInt-safe)."),
             costBasisTon: z.number().positive().describe("TON actually spent on the buy, including gas."),
+            confidenceScore: z.number().int().min(0).max(100).optional()
+                .describe("0-100 confidence score computed from audit, holders, age, liquidity, and tier alignment. Higher = more conviction."),
         }),
     }
 );

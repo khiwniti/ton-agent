@@ -68,6 +68,7 @@ export interface PositionRow {
   entry_at: number;
   amount_tokens: string;
   cost_basis_ton: number;
+  confidence_score: number;
   current_price_ton: number | null;
   pnl_pct: number | null;
   status: "OPEN" | "TP1_HIT" | "CLOSED" | "STOPPED";

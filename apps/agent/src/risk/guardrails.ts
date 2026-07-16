@@ -1,5 +1,7 @@
-import { db, dailyPnlStore } from "../storage/store";
+import { db, dailyPnlStore, positionsStore } from "../storage/store";
 import { log } from "../logger";
+export { computeConfidenceScore } from "./scoring";
+export type { ConfidenceInput, ScoreBreakdown } from "./scoring";
 
 // Standard risk configuration per tier.
 // Mirrors the frontend settings (RiskParams.tsx).
@@ -37,6 +39,12 @@ export const TIER_RISK_CONFIGS: Record<"low" | "mid" | "high", TierRiskConfig> =
 
 export const DAILY_LOSS_LIMIT_TON = parseFloat(process.env.DAILY_LOSS_LIMIT_TON || "2.0");
 
+/** Max portfolio allocation per trade (5% of available balance) */
+export const MAX_PORTFOLIO_ALLOCATION_PCT = parseFloat(process.env.MAX_PORTFOLIO_ALLOCATION_PCT || "5");
+
+/** Max slippage tolerance (1.5%) */
+export const MAX_SLIPPAGE_PCT = parseFloat(process.env.MAX_SLIPPAGE_PCT || "1.5");
+
 /**
  * 1. Circuit Breaker
  * Returns true if today's PnL is safe, false if loss limit is breached.
@@ -48,6 +56,67 @@ export function checkCircuitBreaker(): boolean {
     return false;
   }
   return true;
+}
+
+/**
+ * 1b. Portfolio Allocation Check
+ * Ensures trade size does not exceed MAX_PORTFOLIO_ALLOCATION_PCT of
+ * the wallet's available balance.
+ */
+export function checkPortfolioAllocation(
+  requestedTon: number,
+  balanceTon: number,
+  openPositionsCostBasisTon: number = 0,
+): { allowed: boolean; reason?: string; maxAllowedTon?: number } {
+  // Available capital = current balance (open positions already deducted)
+  // Max allocation = available balance * allocation_pct / 100
+  const available = balanceTon;
+  const maxAllowed = available * (MAX_PORTFOLIO_ALLOCATION_PCT / 100);
+
+  if (requestedTon > maxAllowed) {
+    return {
+      allowed: false,
+      reason: `trade ${requestedTon}TON exceeds ${MAX_PORTFOLIO_ALLOCATION_PCT}% allocation (max ${maxAllowed.toFixed(4)}TON)`,
+      maxAllowedTon: maxAllowed,
+    };
+  }
+
+  return { allowed: true, maxAllowedTon: maxAllowed };
+}
+
+/**
+ * 1c. Slippage Validation
+ * Checks that simulated slippage does not exceed MAX_SLIPPAGE_PCT.
+ *
+ * @param expectedOutput The expected output amount (in nano-jetton units)
+ * @param minOutput The minimum output amount acceptable (after slippage)
+ * @returns Whether the slippage is within tolerance
+ */
+export function checkSlippage(
+  expectedOutput: bigint,
+  minOutput: bigint,
+): { allowed: boolean; reason?: string; slippagePct?: number } {
+  if (expectedOutput <= 0n) {
+    return { allowed: false, reason: "expected output must be positive" };
+  }
+  if (minOutput <= 0n) {
+    return { allowed: false, reason: "min output must be positive" };
+  }
+
+  // Actual slippage: how much worse minOutput is vs. expectedOutput
+  // slippage% = ((expected - min) / expected) * 100
+  const diff = expectedOutput - minOutput;
+  const slippagePct = Number((diff * 10000n) / expectedOutput) / 100;
+
+  if (slippagePct > MAX_SLIPPAGE_PCT) {
+    return {
+      allowed: false,
+      reason: `slippage ${slippagePct.toFixed(2)}% exceeds max ${MAX_SLIPPAGE_PCT}%`,
+      slippagePct,
+    };
+  }
+
+  return { allowed: true, slippagePct };
 }
 
 /**

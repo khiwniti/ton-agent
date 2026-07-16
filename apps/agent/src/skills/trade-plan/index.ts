@@ -7,9 +7,15 @@
  * (BigInt("0") / 2n = 0n → DEX forwards zero → no TP1 ever). Instead the
  * skill returns `verdict: "UNRECORDED"` and emits a loud warning so the
  * operator can manually reconcile.
+ *
+ * v3: computes a confidence score (0-100) for every trade and persists it
+ * alongside the position. The score is derived from audit results, holder
+ * count, token age, pool liquidity, and tier alignment.
  */
 import { newId } from "@ton-agent/shared";
 import { log } from "../../logger";
+import { computeConfidenceScore } from "../../risk/scoring";
+import { TIER_RISK_CONFIGS } from "../../risk/guardrails";
 import type { SkillHandler, SkillContext } from "../runtime";
 import { manifest } from "./manifest";
 
@@ -45,6 +51,20 @@ const execute: SkillHandler<Input, Output>["execute"] = async (input, ctx: Skill
         log.warn("TRADE-PLAN", `AUDIT_FAILED jetton=${input.jettonMaster}`);
         return { ok: false, verdict: "AUDIT_FAILED", error: "audit gates failed (renounce/lp/honeypot)" };
     }
+
+    // 1b. Compute confidence score from audit + metadata.
+    const confidenceScore = computeConfidenceScore({
+        renounced: auditResult.renounced,
+        lpLocked: auditResult.lpLocked,
+        honeypotSafe: auditResult.honeypotSafe,
+        holders: Number(auditResult.holders ?? 0),
+        ageHours: Number(auditResult.ageHours ?? 0),
+        liquidityTon: null,  // trade-plan doesn't fetch pool liquidity directly
+        poolAvailable: !!input.poolAddress,
+        tier: input.tier,
+        minAiScore: TIER_RISK_CONFIGS[input.tier].minAiScore,
+    });
+    log.info("TRADE-PLAN", `confidence_score=${confidenceScore.total} (audit=${confidenceScore.audit} holders=${confidenceScore.holders} age=${confidenceScore.age} liq=${confidenceScore.liquidity} bonus=${confidenceScore.tierBonus})`);
 
     // 2. Risk gate
     const risk = await gate({ tier: input.tier });
@@ -114,6 +134,7 @@ const execute: SkillHandler<Input, Output>["execute"] = async (input, ctx: Skill
         entryPriceUsd: undefined,
         amountTokens,
         costBasisTon,
+        confidenceScore: confidenceScore.total,
     });
 
     // 5. Notify
@@ -127,6 +148,8 @@ const execute: SkillHandler<Input, Output>["execute"] = async (input, ctx: Skill
                 amountTon: input.amountTon,
                 amountTokens,
                 positionId,
+                confidenceScore: confidenceScore.total,
+                scoreBreakdown: confidenceScore,
                 reasoning: input.reasoning ?? "trade-plan skill",
             },
         });

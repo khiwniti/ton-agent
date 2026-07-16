@@ -58,6 +58,7 @@ create table if not exists public.positions (
   entry_at           bigint not null,
   amount_tokens      text not null default '0',
   cost_basis_ton     double precision not null default 0,
+  confidence_score   integer not null default 0,
   current_price_ton  double precision,
   pnl_pct            double precision,
   status             position_status not null default 'OPEN',
