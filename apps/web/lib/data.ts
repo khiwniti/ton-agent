@@ -1,4 +1,5 @@
 import { createAdminClient } from "@/lib/supabase/admin";
+import { isSupabaseAdminConfigured } from "@/lib/supabase/sentinel";
 import {
   TIERS,
   type AgentStatusRow,
@@ -19,8 +20,8 @@ import type { WalletCardData } from "@/components/WalletCard";
  * Supabase Auth sessions.
  */
 export async function getDashboardCards(): Promise<WalletCardData[]> {
+  if (!isSupabaseAdminConfigured()) return emptyCards();
   const supabase = createAdminClient();
-  if (!supabase) return emptyCards();
 
   const [wallets, statuses, positions] = await Promise.all([
     supabase.from("wallets").select("*"),
