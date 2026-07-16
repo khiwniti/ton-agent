@@ -38,7 +38,7 @@ import {
 } from "@dedust/sdk";
 import { CONFIG } from "../config";
 import { log } from "../logger";
-import { loadKeyPairForTier } from "../wallet/wallet";
+import { loadKeyPair, loadKeyPairForTier } from "../wallet/wallet";
 import { sendTransferLocked } from "../wallet/locked-wallet";
 
 export type Dex = "stonfi" | "dedust";
@@ -325,7 +325,9 @@ export async function executeSwap(
   dex: Dex = CONFIG.strategy.preferredDex
 ): Promise<SwapResult> {
   try {
-    const kp = await loadKeyPairForTier(tier);
+    // LOW tier uses the legacy (non-HD) mnemonic path — must match the coordinator.
+    // MID/HIGH use HD derivation with per-tier indices.
+    const kp = tier === "low" ? await loadKeyPair() : await loadKeyPairForTier(tier);
     const { WalletContractV5R1, WalletContractV4 } = await import("@ton/ton");
     let w: any;
     if (CONFIG.walletVersion === "v4r2") {

@@ -19,6 +19,7 @@ import { fromNano, TonClient } from "@ton/ton";
 import { CONFIG } from "../config";
 import { log } from "../logger";
 import {
+  loadKeyPair,
   loadKeyPairForTier,
   makeClient,
   openWallet,
@@ -109,7 +110,9 @@ class TierCoordinator {
 
     for (const tier of ALL_TIERS) {
       try {
-        const kp = await loadKeyPairForTier(tier);
+        // LOW tier uses the legacy (non-HD) mnemonic path — same as Tonkeeper/MyTonWallet.
+        // MID/HIGH use HD derivation with per-tier indices (2, 3) for sub-wallets.
+        const kp = tier === "low" ? await loadKeyPair() : await loadKeyPairForTier(tier);
         const wallet = openWallet(this.client, kp);
         const balanceNano = await wallet.getBalance();
         const balanceTon = Number(fromNano(balanceNano));
