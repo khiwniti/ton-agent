@@ -9,10 +9,12 @@ import { mnemonicToPrivateKey, mnemonicToHDSeed, deriveEd25519Path, keyPairFromS
 import { CONFIG } from "../config";
 
 export function makeClient(): TonClient {
-  return new TonClient({
-    endpoint: CONFIG.rpcEndpoint,
-    apiKey: CONFIG.tonApiKey || undefined,
-  });
+  // TonCenter accepts the API key as a query parameter on the endpoint URL.
+  // The `endpoint` param is the full URL including the api_key query string.
+  const url = CONFIG.tonApiKey
+    ? `${CONFIG.rpcEndpoint}${CONFIG.rpcEndpoint.includes('?') ? '&' : '?'}api_key=${CONFIG.tonApiKey}`
+    : CONFIG.rpcEndpoint;
+  return new TonClient({ endpoint: url });
 }
 
 export interface KeyPair {
