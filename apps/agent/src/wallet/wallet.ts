@@ -9,10 +9,10 @@ import { mnemonicToPrivateKey, mnemonicToHDSeed, deriveEd25519Path, keyPairFromS
 import { CONFIG } from "../config";
 
 export function makeClient(): TonClient {
-  const endpoint = CONFIG.tonApiKey
-    ? `${CONFIG.rpcEndpoint}${CONFIG.rpcEndpoint.includes('?') ? '&' : '?'}api_key=${CONFIG.tonApiKey}`
-    : CONFIG.rpcEndpoint;
-  return new TonClient({ endpoint });
+  return new TonClient({
+    endpoint: CONFIG.rpcEndpoint,
+    apiKey: CONFIG.tonApiKey || undefined,
+  });
 }
 
 export interface KeyPair {
