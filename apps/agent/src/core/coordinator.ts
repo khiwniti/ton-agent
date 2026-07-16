@@ -177,6 +177,7 @@ class TierCoordinator {
       handle,
       dailyPnl,
       circuitBreakerOk: dailyPnl > -DAILY_LOSS_LIMIT_TON,
+      observeOnly: CONFIG.observeOnly,
     });
   }
 
@@ -199,6 +200,10 @@ class TierCoordinator {
       }
     } else {
       // Sells bypass the position-count cap (closing a position should never be blocked).
+      if (CONFIG.observeOnly) {
+        log.warn("COORD", `[${tier.toUpperCase()}] SELL blocked — observe-only mode`);
+        return { ok: false, dex, error: "observe-only mode — all trades blocked" };
+      }
       if (this.state.killSwitchActive) {
         log.warn("COORD", `[${tier.toUpperCase()}] SELL blocked — kill-switch active`);
         return { ok: false, dex, error: "kill-switch active" };

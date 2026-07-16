@@ -48,6 +48,9 @@ async function main() {
     );
     log.info("BOOT", `network=${CONFIG.network} rpc=${CONFIG.rpcEndpoint}`);
     log.info("BOOT", `preferred dex=${CONFIG.strategy.preferredDex}`);
+    if (CONFIG.observeOnly) {
+        log.banner("⚠️ OBSERVE-ONLY MODE", "Agent will scan markets but place NO trades — set OBSERVE_ONLY=false to enable execution.");
+    }
 
     // 1. Tier coordinator — derived wallets, kill-switch, circuit breaker.
     try {

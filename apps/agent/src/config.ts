@@ -69,6 +69,7 @@ export const CONFIG = {
     walletVersion: opt("WALLET_VERSION", "v5r1") as "v3r2" | "v4r2" | "v5r1",
     walletSubwalletId: num("WALLET_SUBWALLET_ID", 698983191),
     publicWebhookUrl: opt("PUBLIC_WEBHOOK_URL", ""),
+    observeOnly: bool("OBSERVE_ONLY", false),
     agentSharedSecret: req("AGENT_SHARED_SECRET"),
     nvidiaApiKey: req("NVIDIA_API_KEY"),
     nvidiaModel: opt("NVIDIA_MODEL", "meta/llama-3.1-405b-instruct"),

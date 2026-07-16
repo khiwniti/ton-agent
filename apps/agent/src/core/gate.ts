@@ -40,6 +40,8 @@ export interface TradeGateInput {
   handle?: TierHandle;
   circuitBreakerOk: boolean;
   dailyPnl: number;
+  /** When true, all trades are blocked. Set via OBSERVE_ONLY env var. */
+  observeOnly?: boolean;
 }
 
 export interface TradeGateResult {
@@ -57,6 +59,9 @@ export function evaluateTradeGate(input: TradeGateInput): TradeGateResult {
   const { tier, requestedTon, killSwitchActive, killSwitchReason, handle, circuitBreakerOk } = input;
   if (!handle) {
     return { allowed: false, reason: `tier ${tier} not initialized` };
+  }
+  if (input.observeOnly) {
+    return { allowed: false, reason: "observe-only mode — all trades blocked" };
   }
   if (killSwitchActive) {
     return { allowed: false, reason: `kill-switch active: ${killSwitchReason ?? "n/a"}` };
