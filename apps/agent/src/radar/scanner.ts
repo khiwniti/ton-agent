@@ -18,6 +18,7 @@ import { CONFIG } from "../config";
 import { log } from "../logger";
 import { newId, type RiskTier, type RadarEvent } from "@ton-agent/shared";
 import { fullAudit } from "../security/audit";
+import { computeConfidenceScore } from "../risk/scoring";
 import { makeClient } from "../wallet/wallet";
 import { runTradeBrain } from "../ai/brain";
 import { tonapiGet } from "../http/tonapi";
@@ -106,13 +107,27 @@ export async function startRadar(_printOnly = false) {
             continue;
           }
 
+          // Compute confidence score from audit data + pool metadata.
+          // This runs BEFORE the LLM is called so the event always has a score.
+          const score = computeConfidenceScore({
+            renounced: audit.renounced,
+            lpLocked: audit.lpLocked,
+            honeypotSafe: audit.honeypotSafe,
+            holders: audit.holders,
+            ageHours: audit.ageHours || 0,
+            liquidityTon: c.liquidityTon ?? null,
+            poolAvailable: !!c.pool,
+            tier: "low",
+            minAiScore: 50, // radar uses a generous threshold — any passable audit qualifies
+          });
+
           // Gate the LLM-driven plan behind the budget. When over budget we
           // still push the event (with HOLD action, conservative defaults) so
           // the operator sees the audit result on the web UI.
           const budget = tryConsumeLlmCall(`radar:${c.master.slice(0, 8)}`);
           let action: RadarEvent["action"] = "HOLD";
-          let confidence = 0;
-          let reasoning = budget.allowed ? "scan completed" : `LLM budget exhausted (${budget.reason ?? "n/a"}) — audit only`;
+          let confidence = score.total;
+          let reasoning = budget.allowed ? `score=${score.total} (audit=${score.audit} h=${score.holders} a=${score.age} l=${score.liquidity})` : `LLM budget exhausted (${budget.reason ?? "n/a"}) — audit only`;
 
           if (budget.allowed) {
             const prompt = `Candidate jetton ${c.master}\n` +
