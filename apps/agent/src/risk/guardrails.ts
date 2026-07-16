@@ -13,21 +13,21 @@ export interface TierRiskConfig {
 
 export const TIER_RISK_CONFIGS: Record<"low" | "mid" | "high", TierRiskConfig> = {
   low: {
-    maxPositionTon: 1.0,
+    maxPositionTon: 0.02,
     maxOpen: 2,
     takeProfitPct: 25,
     stopLossPct: 15,
     minAiScore: 80,
   },
   mid: {
-    maxPositionTon: 3.0,
+    maxPositionTon: 0.05,
     maxOpen: 3,
     takeProfitPct: 60,
     stopLossPct: 25,
     minAiScore: 65,
   },
   high: {
-    maxPositionTon: 5.0,
+    maxPositionTon: 0.1,
     maxOpen: 4,
     takeProfitPct: 150,
     stopLossPct: 40,

@@ -78,9 +78,9 @@ export function evaluateTradeGate(input: TradeGateInput): TradeGateResult {
       reason: `requested ${requestedTon} > tier cap ${handle.config.maxPositionTon}`,
     };
   }
-  // 0.3 TON cushion for gas + slippage so a trade that fits balance at sign-time
+  // 0.01 TON cushion for gas + slippage so a trade that fits balance at sign-time
   // doesn't fail mid-broadcast.
-  if (handle.balanceTon < requestedTon + 0.3) {
+  if (handle.balanceTon < requestedTon + 0.01) {
     return {
       allowed: false,
       reason: `insufficient balance ${handle.balanceTon} < ${requestedTon + 0.3}`,
