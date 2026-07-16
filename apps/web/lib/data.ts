@@ -1,4 +1,4 @@
-import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import {
   TIERS,
   type AgentStatusRow,
@@ -12,9 +12,15 @@ import type { WalletCardData } from "@/components/WalletCard";
  * Assemble the 3-wallet dashboard view. Combines the `wallets` table with
  * live `agent_status` (open positions / PnL) and derives a small PnL history
  * from recent closed positions for the sparkline.
+ *
+ * Uses the admin client (service role key) so the password-login users can
+ * read data without a Supabase Auth session. The RLS policies require the
+ * `authenticated` role, but this app uses custom cookie-based auth, not
+ * Supabase Auth sessions.
  */
 export async function getDashboardCards(): Promise<WalletCardData[]> {
-  const supabase = await createClient();
+  const supabase = createAdminClient();
+  if (!supabase) return emptyCards();
 
   const [wallets, statuses, positions] = await Promise.all([
     supabase.from("wallets").select("*"),
@@ -65,4 +71,16 @@ export async function getDashboardCards(): Promise<WalletCardData[]> {
       pnlHistory: historyByTier.get(tier) ?? [],
     } satisfies WalletCardData;
   });
+}
+
+function emptyCards(): WalletCardData[] {
+  return TIERS.map((tier) => ({
+    tier,
+    address: "",
+    balanceTon: 0,
+    openPositions: 0,
+    totalPnlTon: 0,
+    status: "active",
+    pnlHistory: [],
+  }));
 }
