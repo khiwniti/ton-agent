@@ -76,6 +76,18 @@ export interface SwapRequest {
   side: "buy" | "sell";
   minOutJettonNano?: string;   // slippage control for buy
   jettonAmountNano?: string;   // amount of jettons to sell
+  /** TODO(future): Route the swap through the budgeting wallet contract
+   *  using the agent's ephemeral key and signed transfer serializer.
+   *  The budgeting contract validates signature + daily spend limits
+   *  before forwarding the swap payload to the DEX.
+   *
+   *  Currently reserved — executeSwap does not check these fields yet.
+   *  To enable, wire executeSwap to call executeSwapViaBudgetingWallet
+   *  from agentic-wallet.ts when useBudgetingWallet=true. */
+  useBudgetingWallet?: boolean;
+  /** Address of the deployed budgeting contract. Required when
+   *  useBudgetingWallet is true. */
+  budgetingAddress?: string;
 }
 
 /**
@@ -159,23 +171,56 @@ async function stonfiBuy(
   return { ok: r.ok, dex: "stonfi", error: r.error, amountTokens: r.ok ? amountTokens : undefined };
 }
 
-/** Ston.fi — SELL Jetton → TON (TODO: cell builder for jetton-wallet transfer). */
+/** Ston.fi — SELL Jetton → TON */
 async function stonfiSell(
-  _client: TonClient,
-  _w: any,
-  _kp: any,
+  client: TonClient,
+  w: any,
+  kp: any,
   p: SwapRequest,
-  _tier: "low" | "mid" | "high"
+  tier: "low" | "mid" | "high"
 ): Promise<SwapResult> {
-  // Ston.fi SELL via Jetton Wallet → Router: requires TL-B cell for the
-  // jetton-wallet transfer (forward_payload = swap-ton-instruction). Not
-  // implemented yet in this iteration; surface via the .error path so the
-  // caller (route via fallback) knows.
+  if (!p.jettonAmountNano) {
+    throw new Error("jettonAmountNano is required for sell swap");
+  }
+
+  const router = client.open(DEX.v1.Router.create(STONFI_ROUTER_ADDR));
+  const proxyTon = new pTON.v1();
+
+  // Get swap params from the Ston.fi router (returns the tx to execute).
+  // The SDK internally builds the jetton-wallet transfer + forward payload.
+  const txParams = await router.getSwapJettonToTonTxParams({
+    userWalletAddress: w.address,
+    offerJettonAddress: p.jettonMaster,
+    offerAmount: p.jettonAmountNano,
+    proxyTon,
+    minAskAmount: p.minOutJettonNano ?? "1",
+    queryId: Date.now(),
+  });
+
+  log.info(
+    "STONFI",
+    `[${tier.toUpperCase()}] sell seqno=${await w.getSeqno()} jettons=${p.jettonAmountNano}`,
+  );
+  const r = await sendTransferLocked(
+    tier,
+    {
+      wallet: w,
+      secretKey: kp.sec,
+      messages: [
+        internal({
+          to: txParams.to,
+          value: txParams.value,
+          body: txParams.body,
+        }),
+      ],
+    },
+    client
+  );
   return {
-    ok: false,
+    ok: r.ok,
     dex: "stonfi",
-    error: "stonfi sell not yet implemented; route through risk-manager",
-    amountTokens: p.jettonAmountNano,
+    error: r.error,
+    amountTokens: r.ok ? p.jettonAmountNano : undefined,
   };
 }
 
