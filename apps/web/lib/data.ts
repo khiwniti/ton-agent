@@ -65,8 +65,8 @@ export async function getDashboardCards(): Promise<WalletCardData[]> {
     return {
       tier,
       address: w?.address ?? "",
-      balanceTon: w?.balance_ton ?? s?.bankroll_ton ?? 0,
-      openPositions: s?.open_positions ?? w?.open_positions ?? 0,
+      balanceTon: s?.bankroll_ton ?? w?.balance_ton ?? 0,
+      openPositions: w?.open_positions ?? s?.open_positions ?? 0,
       totalPnlTon: s?.total_pnl_ton ?? w?.total_pnl_ton ?? 0,
       status: w?.status ?? "active",
       pnlHistory: historyByTier.get(tier) ?? [],
