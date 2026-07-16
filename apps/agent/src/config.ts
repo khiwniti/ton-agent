@@ -63,6 +63,7 @@ export const CONFIG = {
         "https://toncenter.com/api/v2/jsonRPC"
     ),
     tonApiKey: opt("TON_API_KEY", ""),
+    tonapiKey: opt("TONAPI_KEY", ""),
     tonapiBase: opt("TONAPI_BASE", "https://tonapi.io/v2"),
     mnemonic: reqAny("WALLET_MASTER_MNEMONIC", "WALLET_MNEMONIC"),
     walletVersion: opt("WALLET_VERSION", "v5r1") as "v3r2" | "v4r2" | "v5r1",
