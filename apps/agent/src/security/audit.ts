@@ -101,7 +101,14 @@ export interface SecurityReport {
 }
 
 export async function fullAudit(client: TonClient, master: string, pool?: string): Promise<SecurityReport> {
-  const m = Address.parse(master);
+  // Parse addresses defensively — TONAPI testnet may return malformed addresses
+  let m: Address;
+  try {
+    m = Address.parse(master);
+  } catch {
+    log.warn("SEC", `fullAudit: invalid master address "${master?.slice(0, 20) ?? '?'}"`);
+    return { renounced: false, lpLocked: false, honeypotSafe: false, holders: 0, ageHours: 0, ok: false };
+  }
   const meta = await getJetton(master);
   const renounced = await checkRenounced(client, m);
   const lpLocked = pool ? await checkLpLocked(Address.parse(pool)) : false;

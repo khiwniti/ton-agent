@@ -60,7 +60,10 @@ async function getRecentJettonMasters(
       params: { limit, verified: false, sort: "created" },
       timeoutMs: 8000,
     });
-    const items: TonapiJetton[] = (r.data?.jettons ?? []) as TonapiJetton[];
+    // Defensive: ensure jettons is actually an array (TONAPI testnet may return
+    // a different shape or empty response). Non-array values produce [] safely.
+    const raw = r.data?.jettons;
+    const items: TonapiJetton[] = Array.isArray(raw) ? raw : [];
     return items
       .filter((x): x is TonapiJetton => x != null && !!x.address)
       .map((x) => ({
@@ -70,7 +73,8 @@ async function getRecentJettonMasters(
         liquidityTon: x.pool?.liquidity?.jetton_reserves_in_ton,
       }));
   } catch (e: any) {
-    log.err("RADAR", `getRecentJettonMasters ${e.message}`);
+    const stack = (e as Error)?.stack?.split('\n').slice(0, 4).join(' | ') ?? '';
+    log.err("RADAR", `getRecentJettonMasters ${e.message} ${stack}`);
     return [];
   }
 }
@@ -83,78 +87,85 @@ export async function startRadar(_printOnly = false) {
   let tick = 0;
 
   const tickFn = async () => {
-    tick++;
-    log.info("RADAR", `tick=${tick} ${CONFIG.network} seen=${SEEN.size}`);
+    try {
+      tick++;
+      log.info("RADAR", `tick=${tick} ${CONFIG.network} seen=${SEEN.size}`);
 
-    const recent = await getRecentJettonMasters(30);
-    const candidates: RecentJettonView[] = [
-      ...CONFIG.watchlist.map((m) => ({ master: m })),
-      ...recent,
-    ].filter((c) => !SEEN.has(c.master));
+      const recent = await getRecentJettonMasters(30);
+      const candidates: RecentJettonView[] = [
+        ...CONFIG.watchlist.map((m) => ({ master: m })),
+        ...recent,
+      ].filter((c) => !SEEN.has(c.master));
 
-    for (const c of candidates) {
-      SEEN.add(c.master);
-      try {
-        const audit = await fullAudit(client, c.master, c.pool);
-        if (!audit.ok) {
-          log.warn("RADAR", `skip ${c.master.slice(0, 8)}… audit failed`);
-          continue;
-        }
-
-        // Gate the LLM-driven plan behind the budget. When over budget we
-        // still push the event (with HOLD action, conservative defaults) so
-        // the operator sees the audit result on the web UI.
-        const budget = tryConsumeLlmCall(`radar:${c.master.slice(0, 8)}`);
-        let action: RadarEvent["action"] = "HOLD";
-        let confidence = 0;
-        let reasoning = budget.allowed ? "scan completed" : `LLM budget exhausted (${budget.reason ?? "n/a"}) — audit only`;
-
-        if (budget.allowed) {
-          const prompt = `Candidate jetton ${c.master}\n` +
-            `Symbol: ${c.symbol ?? "?"}\n` +
-            `Liquidity Ton: ${c.liquidityTon ?? "unknown"}\n` +
-            `Audit: renounced=${audit.renounced}, lpLocked=${audit.lpLocked}, honeypotSafe=${audit.honeypotSafe}, holders=${audit.holders}\n` +
-            `Build a written trade plan, choose entry size using max 15% of bankroll cap, then either BUY or SKIP. If you BUY, immediately call notify_web(kind=trade_executed).`;
-
-          try {
-            const result = await runTradeBrain(prompt, { pushToWeb: true });
-            // The brain's emitted action is in metadata; we keep a conservative
-            // default until the agent surfaces one explicitly via notify_web.
-            if (result?.threadId) reasoning = `brain thread=${result.threadId}`;
-          } catch (err: any) {
-            log.warn("RADAR", `brain failed ${err.message}; marking SKIP`);
-            action = "SKIP";
-            reasoning = `brain failed: ${err.message}`;
+      for (const c of candidates) {
+        SEEN.add(c.master);
+        try {
+          const audit = await fullAudit(client, c.master, c.pool);
+          if (!audit.ok) {
+            log.warn("RADAR", `skip ${c.master.slice(0, 8)}… audit failed`);
+            continue;
           }
+
+          // Gate the LLM-driven plan behind the budget. When over budget we
+          // still push the event (with HOLD action, conservative defaults) so
+          // the operator sees the audit result on the web UI.
+          const budget = tryConsumeLlmCall(`radar:${c.master.slice(0, 8)}`);
+          let action: RadarEvent["action"] = "HOLD";
+          let confidence = 0;
+          let reasoning = budget.allowed ? "scan completed" : `LLM budget exhausted (${budget.reason ?? "n/a"}) — audit only`;
+
+          if (budget.allowed) {
+            const prompt = `Candidate jetton ${c.master}\n` +
+              `Symbol: ${c.symbol ?? "?"}\n` +
+              `Liquidity Ton: ${c.liquidityTon ?? "unknown"}\n` +
+              `Audit: renounced=${audit.renounced}, lpLocked=${audit.lpLocked}, honeypotSafe=${audit.honeypotSafe}, holders=${audit.holders}\n` +
+              `Build a written trade plan, choose entry size using max 15% of bankroll cap, then either BUY or SKIP. If you BUY, immediately call notify_web(kind=trade_executed).`;
+
+            try {
+              const result = await runTradeBrain(prompt, { pushToWeb: true });
+              // The brain's emitted action is in metadata; we keep a conservative
+              // default until the agent surfaces one explicitly via notify_web.
+              if (result?.threadId) reasoning = `brain thread=${result.threadId}`;
+            } catch (err: any) {
+              log.warn("RADAR", `brain failed ${err.message}; marking SKIP`);
+              action = "SKIP";
+              reasoning = `brain failed: ${err.message}`;
+            }
+          }
+
+          const e: RadarEvent = {
+            id: newId("rad"),
+            detectedAt: Date.now(),
+            walletTier: "low",
+            jettonMaster: c.master,
+            symbol: c.symbol,
+            poolAddress: c.pool,
+            initialLiquidityTon: c.liquidityTon ?? null,
+            tokenAgeHours: audit.ageHours || 0,
+            renounced: audit.renounced,
+            lpLocked: audit.lpLocked,
+            honeypotSafe: audit.honeypotSafe,
+            aiScore: 0,
+            action,
+            confidence,
+            reasoning,
+          };
+          await pushRadarEvent(e, "low");
+        } catch (err: any) {
+          const stack = (err as Error)?.stack?.split('\n').slice(0, 4).join(' | ') ?? '';
+          log.err("RADAR", `candidate ${c.master?.slice(0, 12) ?? '?'}: ${err.message} ${stack}`);
+          await new Promise((r) => setTimeout(r, 1000));
         }
-
-        const e: RadarEvent = {
-          id: newId("rad"),
-          detectedAt: Date.now(),
-          walletTier: "low",
-          jettonMaster: c.master,
-          symbol: c.symbol,
-          poolAddress: c.pool,
-          initialLiquidityTon: c.liquidityTon ?? null,
-          tokenAgeHours: audit.ageHours || 0,
-          renounced: audit.renounced,
-          lpLocked: audit.lpLocked,
-          honeypotSafe: audit.honeypotSafe,
-          aiScore: 0,
-          action,
-          confidence,
-          reasoning,
-        };
-        await pushRadarEvent(e, "low");
-      } catch (err: any) {
-        log.err("RADAR", `${err.message}`);
-        await new Promise((r) => setTimeout(r, 1000));
       }
-    }
 
-    // Cap memory spent on seen list
-    if (SEEN.size > 2000) {
-      for (const v of [...SEEN].slice(0, 1700)) SEEN.delete(v);
+      // Cap memory spent on seen list
+      if (SEEN.size > 2000) {
+        const arr = [...SEEN];
+        for (let i = 0; i < 1700 && i < arr.length; i++) SEEN.delete(arr[i]);
+      }
+    } catch (tickErr: any) {
+      const stack = (tickErr as Error)?.stack?.split('\n').slice(0, 4).join(' | ') ?? '';
+      log.err("RADAR", `tickFn fatal: ${tickErr.message} ${stack}`);
     }
   };
 
