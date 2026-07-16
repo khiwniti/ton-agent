@@ -36,10 +36,23 @@ import {
   PoolType,
   VaultJetton,
 } from "@dedust/sdk";
-import { CONFIG } from "../config";
+import { CONFIG, isTestnet } from "../config";
 import { log } from "../logger";
 import { loadKeyPair, loadKeyPairForTier } from "../wallet/wallet";
 import { sendTransferLocked } from "../wallet/locked-wallet";
+
+// ── Network-aware DEX contract addresses ──────────────────────────
+// Ston.fi v1 router: mainnet vs testnet.
+const STONFI_ROUTER_ADDR = isTestnet()
+  ? "kQBsGx9ArADUrREB34W-ghgsCgBShvfUr4Jvlu-0KGc33a1n"
+  : "EQB3ncyBUTjZUAUOTn7f_yB-s5SscCjH-M-6f9Z6P3Z-1p";
+
+// DeDust has no public testnet factory; on testnet we fall back to Ston.fi.
+// Keep the mainnet DeDust factory import for mainnet use.
+const DEDUST_FACTORY_ADDR = (() => {
+  if (isTestnet()) return null; // No DeDust on testnet
+  return MAINNET_FACTORY_ADDR;
+})();
 
 export type Dex = "stonfi" | "dedust";
 
@@ -103,7 +116,7 @@ async function stonfiBuy(
   }
 
   const router = client.open(
-    DEX.v1.Router.create("EQB3ncyBUTjZUAUOTn7f_yB-s5SscCjH-M-6f9Z6P3Z-1p")
+    DEX.v1.Router.create(STONFI_ROUTER_ADDR)
   );
   const proxyTon = new pTON.v1();
 
@@ -174,13 +187,16 @@ async function dedustBuy(
   p: SwapRequest,
   tier: "low" | "mid" | "high"
 ): Promise<SwapResult> {
+  if (isTestnet()) {
+    return { ok: false, dex: "dedust", error: "DeDust not available on testnet (no public factory) — use stonfi" };
+  }
   const bal = await w.getBalance();
   const reqd = BigInt(toNano((p.amountTon + 0.25).toString()));
   if (bal < reqd) {
     throw new Error(`insufficient balance have=${fromNano(bal)} need=${fromNano(reqd)}`);
   }
 
-  const factory = client.open(Factory.createFromAddress(MAINNET_FACTORY_ADDR));
+  const factory = client.open(Factory.createFromAddress(DEDUST_FACTORY_ADDR!));
   const tonAsset = Asset.native();
   const jetAsset = Asset.jetton(Address.parse(p.jettonMaster));
   const pool = client.open(
@@ -248,11 +264,14 @@ async function dedustSell(
   p: SwapRequest,
   tier: "low" | "mid" | "high"
 ): Promise<SwapResult> {
+  if (isTestnet()) {
+    return { ok: false, dex: "dedust", error: "DeDust not available on testnet (no public factory) — use stonfi" };
+  }
   if (!p.jettonAmountNano) {
     throw new Error("jettonAmountNano is required for sell swap");
   }
 
-  const factory = client.open(Factory.createFromAddress(MAINNET_FACTORY_ADDR));
+  const factory = client.open(Factory.createFromAddress(DEDUST_FACTORY_ADDR!));
   const tonAsset = Asset.native();
   const jetAsset = Asset.jetton(Address.parse(p.jettonMaster));
   const pool = client.open(
@@ -350,15 +369,21 @@ export async function executeSwap(
       );
     }
 
+    // On testnet, DeDust is unavailable — silently fall back to Ston.fi.
+    const effectiveDex: Dex = isTestnet() && dex === "dedust" ? "stonfi" : dex;
+    if (effectiveDex !== dex) {
+      log.info("DEX", `[${tier.toUpperCase()}] ${dex} not available on testnet — falling back to stonfi`);
+    }
+
     if (p.side === "buy") {
-      const r = dex === "dedust"
+      const r = effectiveDex === "dedust"
         ? await dedustBuy(client, w, kp, p, tier)
         : await stonfiBuy(client, w, kp, p, tier);
       log.trade("DEX", `[${tier.toUpperCase()}] OK ${r.dex} buy ${p.amountTon} TON` +
         (r.amountTokens ? ` → tokens=${r.amountTokens.slice(0, 12)}…` : ""));
       return r;
     } else {
-      const r = dex === "dedust"
+      const r = effectiveDex === "dedust"
         ? await dedustSell(client, w, kp, p, tier)
         : await stonfiSell(client, w, kp, p, tier);
       log.trade("DEX", `[${tier.toUpperCase()}] ${r.ok ? "OK" : "FAIL"} ${r.dex} sell ${p.jettonAmountNano} tokens`);
