@@ -85,3 +85,52 @@ function emptyCards(): WalletCardData[] {
     pnlHistory: [],
   }));
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Recent positions (for the confidence-score table on the dashboard)
+// ──────────────────────────────────────────────────────────────────
+
+export interface PositionView {
+  id: string;
+  walletTier: WalletTier;
+  symbol: string | null;
+  jettonMaster: string;
+  entryPriceTon: number;
+  amountTokens: string;
+  costBasisTon: number;
+  confidenceScore: number;
+  pnlPct: number | null;
+  status: string;
+  createdAt: string;
+}
+
+/** Fetch recent positions sorted newest-first, with confidence scores. */
+export async function getRecentPositions(limit = 50): Promise<PositionView[]> {
+  if (!isSupabaseAdminConfigured()) return [];
+  const supabase = createAdminClient();
+
+  const { data, error } = await supabase
+    .from("positions")
+    .select(
+      "id,wallet_tier,symbol,jetton_master,entry_price_ton,amount_tokens,cost_basis_ton,confidence_score,pnl_pct,status,created_at",
+    )
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error || !data) return [];
+
+  return (data as any[]).map((r) => ({
+    id: r.id,
+    walletTier: r.wallet_tier as WalletTier,
+    symbol: r.symbol ?? null,
+    jettonMaster: r.jetton_master,
+    entryPriceTon: r.entry_price_ton,
+    amountTokens: r.amount_tokens,
+    costBasisTon: r.cost_basis_ton,
+    confidenceScore: r.confidence_score ?? 0,
+    pnlPct: r.pnl_pct,
+    status: r.status,
+    createdAt: r.created_at,
+  }));
+}
+

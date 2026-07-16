@@ -3,7 +3,8 @@ import Link from "next/link";
 import { WalletCard, type WalletCardData } from "@/components/WalletCard";
 import { UserPortfolio } from "@/components/UserPortfolio";
 import { ManualSwapPanel } from "@/components/ManualSwapPanel";
-import { getDashboardCards } from "@/lib/data";
+import { PositionsTable } from "@/components/PositionsTable";
+import { getDashboardCards, getRecentPositions } from "@/lib/data";
 import { isSupabaseAnonConfigured } from "@/lib/supabase/sentinel";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { formatPnl, formatTon } from "@/lib/format";
@@ -16,6 +17,7 @@ export const dynamic = "force-dynamic";
 export default async function DashboardPage() {
   const configured = isSupabaseAnonConfigured();
   const cards = configured ? await getDashboardCards() : emptyCards();
+  const positions = configured ? await getRecentPositions(30) : [];
   const killEngaged = await readKillSwitch();
 
   const totalPnl = cards.reduce((a, c) => a + c.totalPnlTon, 0);
@@ -153,6 +155,11 @@ export default async function DashboardPage() {
           ))}
         </div>
       </section>
+
+      {/* Positions table with confidence scores */}
+      {positions.length > 0 && (
+        <PositionsTable positions={positions} />
+      )}
     </div>
   );
 }
