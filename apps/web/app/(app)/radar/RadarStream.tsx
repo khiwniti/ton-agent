@@ -6,6 +6,7 @@ import type { RadarEventRow, WalletTier } from "@/lib/types";
 import { TIER_LABEL } from "@/lib/types";
 import { ActionBadge } from "@/components/ui/ActionBadge";
 import { Badge, CheckBadge } from "@/components/ui/Badge";
+import { ConfidenceBadge } from "@/components/ui/ConfidenceBadge";
 import { formatTime, truncateAddress } from "@/lib/format";
 
 const TIER_TONE: Record<WalletTier, "teal" | "amber" | "red"> = {
@@ -114,8 +115,8 @@ export function RadarStream({ initial }: { initial: RadarEventRow[] }) {
                   <td className="px-4 py-2">
                     <ActionBadge action={r.action} />
                   </td>
-                  <td className="px-4 py-2 text-right mono text-fg">
-                    {Math.round(r.confidence)}%
+                  <td className="px-4 py-2 text-right">
+                    <ConfidenceBadge score={Math.round(r.confidence)} />
                   </td>
                 </tr>
               ))
