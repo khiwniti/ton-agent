@@ -25,10 +25,21 @@ import { tonapiGet } from "../http/tonapi";
 import { postEnvelope } from "../webhook";
 import { tryConsumeLlmCall } from "./llm-budget";
 
+// Actual TONAPI /jettons response shape (as of 2026-07).
+// Top-level fields: mintable, total_supply, metadata, preview, verification,
+// holders_count, code_hash, data_hash, interfaces. Address lives in metadata,
+// pool info is NOT included — the radar discovers pools via audit.
 interface TonapiJetton {
-  address: string;
-  metadata?: { symbol?: string };
-  pool?: { pool_address?: string; liquidity?: { jetton_reserves_in_ton?: number } };
+  mintable: boolean;
+  total_supply: string;
+  metadata: {
+    address: string;
+    name?: string;
+    symbol?: string;
+    decimals?: string;
+  };
+  verification: string;
+  holders_count: number;
 }
 
 async function pushRadarEvent(
@@ -58,7 +69,7 @@ async function getRecentJettonMasters(
 ): Promise<RecentJettonView[]> {
   try {
     const r = await tonapiGet("/jettons", {
-      params: { limit, verified: false, sort: "created" },
+      params: { limit, verified: "false", sort: "created" },
       timeoutMs: 8000,
     });
     // Defensive: ensure jettons is actually an array (TONAPI testnet may return
@@ -66,12 +77,12 @@ async function getRecentJettonMasters(
     const raw = r.data?.jettons;
     const items: TonapiJetton[] = Array.isArray(raw) ? raw : [];
     return items
-      .filter((x): x is TonapiJetton => x != null && !!x.address)
+      .filter((x): x is TonapiJetton => x != null && !!x.metadata?.address)
       .map((x) => ({
-        master: x.address,
-        pool: x.pool?.pool_address,
+        master: x.metadata.address,
+        pool: undefined,  // TONAPI /jettons does not include pool info
         symbol: x.metadata?.symbol,
-        liquidityTon: x.pool?.liquidity?.jetton_reserves_in_ton,
+        liquidityTon: undefined,  // pool liquidity not available at this level
       }));
   } catch (e: any) {
     const stack = (e as Error)?.stack?.split('\n').slice(0, 4).join(' | ') ?? '';
