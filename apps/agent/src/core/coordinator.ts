@@ -145,7 +145,7 @@ class TierCoordinator {
         // Initial tier_status row in DB
         statusStore.upsert({
           tier,
-          status: tier === "high" && !highUnlocked ? "LOCKED" : "READY",
+          status: tier === "high" && !highUnlocked ? "paused" : "running",
           wallet_address: address,
           started_at: handle.startedAt,
           bankroll_ton: balanceTon,
@@ -379,7 +379,7 @@ class TierCoordinator {
         handle.unlocked = true;
         statusStore.upsert({
           tier: "high",
-          status: "READY",
+          status: "running",
           wallet_address: handle.address,
           updated_at: Date.now(),
         });
@@ -389,7 +389,7 @@ class TierCoordinator {
         handle.unlocked = false;
         statusStore.upsert({
           tier: "high",
-          status: "LOCKED",
+          status: "paused",
           wallet_address: handle.address,
           updated_at: Date.now(),
         });
@@ -430,12 +430,12 @@ class TierCoordinator {
         const statusRow = {
           tier,
           status: this.state.killSwitchActive
-            ? "KILLED"
+            ? "stopped"
             : !handle.unlocked
-              ? "LOCKED"
+              ? "paused"
               : handle.openPositions >= handle.config.maxOpen
-                ? "AT_CAP"
-                : "READY",
+                ? "running"
+                : "running",
           wallet_address: handle.address,
           bankroll_ton: handle.balanceTon,
           open_positions: handle.openPositions,
@@ -462,7 +462,7 @@ class TierCoordinator {
             version: "1.0.0",
           },
           stableId: `status-${tier}`,  // fixed stableId so Supabase upsert overwrites the same row
-        }).catch(() => {}); // fire-and-forget
+        }).catch((e: any) => log.warn("WEBHOOK", `[${tier.toUpperCase()}] status post failed: ${e.message}`));
       } catch (e: any) {
         log.debug("COORD", `[${tier.toUpperCase()}] status refresh failed: ${e.message}`);
       }
@@ -617,7 +617,7 @@ class TierCoordinator {
           confidenceScore: pipelineScore.total,
         },
         stableId: `trade-${swapResult.txHash ?? newId("tx")}`,
-      }).catch(() => {}); // fire-and-forget
+      }).catch((e: any) => log.warn("WEBHOOK", `trade_executed post failed: ${e.message}`));
 
       log.ok("PIPELINE", `[${tier.toUpperCase()}] Step 8 (Log) OK tx=${tx.tx_hash.slice(0, 16)}… confidence=${pipelineScore.total}`);
     } catch (e: any) {
