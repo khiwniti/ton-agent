@@ -108,6 +108,7 @@ export function mapIngest(
           total_pnl_ton: num(payload.totalPnLTon) ?? 0,
           uptime_sec: num(payload.uptimeSec) ?? 0,
           version: str(payload.version) ?? "unknown",
+          updated_at: new Date().toISOString(),
         },
       };
 
