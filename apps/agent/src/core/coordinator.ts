@@ -421,8 +421,16 @@ class TierCoordinator {
     for (const tier of ALL_TIERS) {
       const handle = this.tiers[tier];
       if (!handle) continue;
+
+      // Refresh balance independently — a rate-limit (429) on balance fetch
+      // must NOT prevent the status push to the dashboard.
       try {
         await this.refreshBalance(tier);
+      } catch {
+        // Already logged at debug level inside refreshBalance.
+      }
+
+      try {
         handle.openPositions = positionsStore.listOpenByTier(tier).length;
         handle.closedTrades = positionsStore.countClosedForTier(tier);
         handle.dailyPnlTon = dailyPnlStore.getTodayPnl();
@@ -433,9 +441,7 @@ class TierCoordinator {
             ? "stopped"
             : !handle.unlocked
               ? "paused"
-              : handle.openPositions >= handle.config.maxOpen
-                ? "running"
-                : "running",
+              : "running",
           wallet_address: handle.address,
           bankroll_ton: handle.balanceTon,
           open_positions: handle.openPositions,
@@ -461,10 +467,10 @@ class TierCoordinator {
             uptimeSec: Math.floor(uptimeSec),
             version: "1.0.0",
           },
-          stableId: `status-${tier}`,  // fixed stableId so Supabase upsert overwrites the same row
+          stableId: `status-${tier}`,
         }).catch((e: any) => log.warn("WEBHOOK", `[${tier.toUpperCase()}] status post failed: ${e.message}`));
       } catch (e: any) {
-        log.debug("COORD", `[${tier.toUpperCase()}] status refresh failed: ${e.message}`);
+        log.warn("COORD", `[${tier.toUpperCase()}] status push failed: ${e.message}`);
       }
     }
 
