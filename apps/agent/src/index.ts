@@ -13,6 +13,7 @@ import { CONFIG } from "./config";
 import { fromNano } from "@ton/ton";
 import { makeClient, openWallet, loadKeyPair } from "./wallet/wallet";
 import { getCoordinator, startCoordinator, isCoordinatorStarted } from "./core/coordinator";
+import { postEnvelope } from "./webhook";
 import { startRadar } from "./radar/scanner";
 import { runMonitor } from "./wallet/position-manager";
 // Side-effect import — registers all skills so the brain prompt and the
@@ -57,6 +58,24 @@ async function main() {
         await startCoordinator();
         const snap = getCoordinator().getSnapshot();
         log.ok("BOOT", `coordinator up — tiers=${snap.tiers.length} highUnlocked=${snap.highUnlocked} cb=${snap.circuitBreaker.ok ? "ok" : "TRIPPED"}`);
+
+        // DIAGNOSTIC: force one-shot postEnvelope to test the pipeline
+        postEnvelope({
+            kind: "status",
+            walletTier: "low",
+            payload: {
+                status: "running",
+                startedAt: snap.startedAt,
+                bankrollTon: snap.tiers.find(t => t.tier === "low")?.balanceTon ?? 0,
+                openPositions: 0,
+                totalPnLTon: 0,
+                uptimeSec: Math.floor(snap.uptimeSec),
+                version: "1.0.0",
+            },
+            stableId: "diag-boot",
+        }).then((r) => {
+            log.ok("BOOT", `DIAG webhook sent=${r.sent} id=${r.id}${r.reason ? " reason=" + r.reason : ""}${r.error ? " error=" + r.error : ""}`);
+        });
     } catch (e: any) {
         log.err("BOOT", `coordinator failed to boot: ${e.message}`);
         // Continue: the rest of the runtime still useful for observe-only ops.
