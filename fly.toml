@@ -11,7 +11,7 @@ primary_region = 'sin'
 
 [env]
   DATA_DIR = '/app/data'
-  HEALTH_PORT = '8080'
+  HEALTH_PORT = '9090'
   NODE_ENV = 'production'
 
 [[mounts]]
@@ -20,7 +20,7 @@ primary_region = 'sin'
 
 [[services]]
   protocol = 'tcp'
-  internal_port = 8080
+  internal_port = 9090
 
   [[services.ports]]
     port = 80
