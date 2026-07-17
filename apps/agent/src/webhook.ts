@@ -40,6 +40,7 @@ export async function postEnvelope(opts: PostEnvelopeOpts): Promise<PostEnvelope
     return { sent: false, id, reason: "PUBLIC_WEBHOOK_URL not set" };
   }
   try {
+    log.info("WEBHOOK", `POST kind=${opts.kind} tier=${opts.walletTier ?? '-'} id=${id}`);
     await axios.post(
       url,
       {
@@ -57,6 +58,7 @@ export async function postEnvelope(opts: PostEnvelopeOpts): Promise<PostEnvelope
         timeout: 10_000,
       }
     );
+    log.ok("WEBHOOK", `OK kind=${opts.kind} id=${id}`);
     return { sent: true, id };
   } catch (e: any) {
     log.warn("WEBHOOK", `post failed kind=${opts.kind} id=${id} → ${e.message}`);
