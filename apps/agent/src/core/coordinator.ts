@@ -435,6 +435,7 @@ class TierCoordinator {
         handle.closedTrades = positionsStore.countClosedForTier(tier);
         handle.dailyPnlTon = dailyPnlStore.getTodayPnl();
 
+        const startedAt = ((handle as any).startedAt) ?? this.state.startedAt;
         const statusRow = {
           tier,
           status: this.state.killSwitchActive
@@ -443,6 +444,7 @@ class TierCoordinator {
               ? "paused"
               : "running",
           wallet_address: handle.address,
+          started_at: startedAt,
           bankroll_ton: handle.balanceTon,
           open_positions: handle.openPositions,
           closed_trades: handle.closedTrades,
