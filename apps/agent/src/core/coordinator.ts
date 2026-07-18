@@ -31,6 +31,7 @@ import {
   statusStore,
   dailyPnlStore,
   tradeTransactionStore,
+  decisionJournalStore,
   DbTradeTransaction,
 } from "../storage/store";
 import {
@@ -40,6 +41,16 @@ import {
   DAILY_LOSS_LIMIT_TON,
   checkPortfolioAllocation,
 } from "../risk/guardrails";
+import {
+  authorizeTicket,
+  buildCapContext,
+  consumeAuthorization,
+  hashTradeTicket,
+  verifyCapBinding,
+  type CapCheckResult,
+  type RiskAssessment,
+  type TradeTicket,
+} from "../safetycaps";
 import { postEnvelope } from "../webhook";
 import { newId } from "@ton-agent/shared";
 
@@ -192,43 +203,255 @@ class TierCoordinator {
   // ─────────────────────────────────────────────────────────────────
   // 3. Centralized swap execution — used by the brain
   // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Build a TradeTicket from a swap request + optional risk fields.
+   * Tickets are proposals only until SafetyCaps greenlights them.
+   */
+  buildTradeTicket(
+    tier: Tier,
+    p: SwapRequest,
+    opts?: {
+      cycleId?: string;
+      risk?: RiskAssessment | null;
+      slippagePct?: number;
+      poolTvlTon?: number;
+      aiScore?: number;
+    },
+  ): TradeTicket {
+    return {
+      cycle_id: opts?.cycleId ?? newId("cycle"),
+      tier,
+      side: p.side,
+      jetton_master: p.jettonMaster,
+      amount_ton: p.amountTon,
+      risk: opts?.risk ?? null,
+      slippage_pct: opts?.slippagePct,
+      pool_tvl_ton: opts?.poolTvlTon,
+      ai_score: opts?.aiScore,
+    };
+  }
+
+  /**
+   * Run SafetyCaps against a ticket for the live tier snapshot and journal it.
+   * On success, registers a single-use authorization in the in-process registry.
+   */
+  authorizeForTier(
+    tier: Tier,
+    ticket: TradeTicket,
+  ): CapCheckResult {
+    const handle = this.tiers[tier];
+    const dailyPnl = dailyPnlStore.getTodayPnl();
+    const ctx = buildCapContext({
+      tier,
+      balanceTon: handle?.balanceTon ?? 0,
+      openPositions: handle?.openPositions ?? 0,
+      unlocked: handle?.unlocked ?? tier !== "high",
+      killSwitchActive: this.state.killSwitchActive,
+      killSwitchReason: this.state.killSwitchReason,
+      circuitBreakerOk: dailyPnl > -DAILY_LOSS_LIMIT_TON,
+      observeOnly: CONFIG.observeOnly,
+      dailyPnlTon: dailyPnl,
+    });
+    const cap = authorizeTicket(ticket, ctx);
+    decisionJournalStore.append({
+      cycle_id: ticket.cycle_id,
+      agent: "safetycaps",
+      input_hash: cap.ticket_hash,
+      cap_check_result: cap,
+      hitl_status: cap.hitl_status,
+      final_action: cap.ok
+        ? cap.hitl_required
+          ? "cap_ok_hitl_required"
+          : "cap_ok"
+        : "cap_denied",
+      output: { failures: cap.failures },
+    });
+    return cap;
+  }
+
   async executeForTier(
     tier: Tier,
     p: SwapRequest,
     dex: Dex = CONFIG.strategy.preferredDex,
-  ): Promise<{ ok: boolean; dex: Dex; error?: string; txHash?: string; amountTokens?: string }> {
+    auth?: {
+      /** Pre-issued ticket_hash from authorizeForTier / authorizeTicket. */
+      ticketHash?: string;
+      /** Full ticket if already built (must match swap request intent). */
+      ticket?: TradeTicket;
+      /** Optional risk assessment folded into ticket when building one. */
+      risk?: RiskAssessment | null;
+      cycleId?: string;
+      /** When true, skip single-use consume (pipeline internal re-entry). */
+      skipConsume?: boolean;
+      poolTvlTon?: number;
+      slippagePct?: number;
+      aiScore?: number;
+    },
+  ): Promise<{
+    ok: boolean;
+    dex: Dex;
+    error?: string;
+    txHash?: string;
+    amountTokens?: string;
+    cap?: CapCheckResult;
+    cycle_id?: string;
+  }> {
     const handle = this.tiers[tier];
+    if (!handle) {
+      return { ok: false, dex, error: `tier ${tier} not initialized` };
+    }
 
-    // For buys, gate against tier risk config before going to the DEX.
-    if (p.side === "buy") {
-      const gate = this.isTradeAllowed(tier, p.amountTon);
-      if (!gate.allowed) {
-        log.warn("COORD", `[${tier.toUpperCase()}] swap DENIED: ${gate.reason}`);
-        return { ok: false, dex, error: gate.reason };
+    const ticket =
+      auth?.ticket ??
+      this.buildTradeTicket(tier, p, {
+        cycleId: auth?.cycleId,
+        risk: auth?.risk,
+        poolTvlTon: auth?.poolTvlTon,
+        slippagePct: auth?.slippagePct,
+        aiScore: auth?.aiScore,
+      });
+
+    // Intent must match the ticket economic fields.
+    if (
+      ticket.tier !== tier ||
+      ticket.side !== p.side ||
+      ticket.jetton_master !== p.jettonMaster ||
+      Number(ticket.amount_ton.toFixed(9)) !== Number(p.amountTon.toFixed(9))
+    ) {
+      const msg = "ticket does not match swap request intent";
+      log.warn("COORD", `[${tier.toUpperCase()}] ${msg}`);
+      decisionJournalStore.append({
+        cycle_id: ticket.cycle_id,
+        agent: "coordinator",
+        input_hash: hashTradeTicket(ticket),
+        final_action: "execute_denied_ticket_mismatch",
+        output: { error: msg },
+      });
+      return { ok: false, dex, error: msg, cycle_id: ticket.cycle_id };
+    }
+
+    let cap: CapCheckResult | undefined;
+
+    // Prefer consuming a pre-issued authorization (LLM presents ticket_hash only —
+    // never trust a model-authored CapCheckResult JSON blob).
+    if (auth?.ticketHash && !auth.skipConsume) {
+      const issued = consumeAuthorization(auth.ticketHash);
+      if (issued) {
+        const bind = verifyCapBinding(ticket, issued);
+        if (!bind.allowed) {
+          log.warn("COORD", `[${tier.toUpperCase()}] auth bind failed: ${bind.reason}`);
+          decisionJournalStore.append({
+            cycle_id: ticket.cycle_id,
+            agent: "coordinator",
+            input_hash: issued.ticket_hash,
+            cap_check_result: issued,
+            final_action: "execute_denied_bind",
+            output: { error: bind.reason },
+          });
+          return {
+            ok: false,
+            dex,
+            error: bind.reason,
+            cap: issued,
+            cycle_id: ticket.cycle_id,
+          };
+        }
+        cap = issued;
+      } else {
+        // Stale/unknown hash: re-run caps; only proceed if live hash matches claim.
+        const live = this.authorizeForTier(tier, ticket);
+        consumeAuthorization(live.ticket_hash);
+        if (live.ticket_hash !== auth.ticketHash) {
+          const msg = `ticket_hash mismatch: provided ${auth.ticketHash} != live ${live.ticket_hash}`;
+          log.warn("COORD", `[${tier.toUpperCase()}] ${msg}`);
+          decisionJournalStore.append({
+            cycle_id: ticket.cycle_id,
+            agent: "coordinator",
+            input_hash: live.ticket_hash,
+            cap_check_result: live,
+            final_action: "execute_denied_hash_mismatch",
+            output: { error: msg },
+          });
+          return { ok: false, dex, error: msg, cap: live, cycle_id: ticket.cycle_id };
+        }
+        cap = live;
       }
-    } else {
-      // Sells bypass the position-count cap (closing a position should never be blocked).
-      if (CONFIG.observeOnly) {
-        log.warn("COORD", `[${tier.toUpperCase()}] SELL blocked — observe-only mode`);
-        return { ok: false, dex, error: "observe-only mode — all trades blocked" };
+    }
+
+    // No pre-auth: run SafetyCaps now (coordinator / pipeline path).
+    if (!cap) {
+      cap = this.authorizeForTier(tier, ticket);
+      if (!auth?.skipConsume) {
+        consumeAuthorization(cap.ticket_hash);
       }
-      if (this.state.killSwitchActive) {
-        log.warn("COORD", `[${tier.toUpperCase()}] SELL blocked — kill-switch active`);
-        return { ok: false, dex, error: "kill-switch active" };
-      }
+    }
+
+    if (!cap.ok) {
+      const reason = cap.failures.map((f) => f.reason).join("; ") || "cap denied";
+      log.warn("COORD", `[${tier.toUpperCase()}] SafetyCaps DENIED: ${reason}`);
+      decisionJournalStore.append({
+        cycle_id: ticket.cycle_id,
+        agent: "coordinator",
+        input_hash: cap.ticket_hash,
+        cap_check_result: cap,
+        hitl_status: cap.hitl_status,
+        final_action: "execute_denied_caps",
+        output: { error: reason },
+      });
+      return { ok: false, dex, error: reason, cap, cycle_id: ticket.cycle_id };
+    }
+
+    if (cap.hitl_required && cap.hitl_status !== "approved") {
+      const reason = `HITL required (status=${cap.hitl_status}) — not auto-executable`;
+      log.warn("COORD", `[${tier.toUpperCase()}] ${reason}`);
+      decisionJournalStore.append({
+        cycle_id: ticket.cycle_id,
+        agent: "coordinator",
+        input_hash: cap.ticket_hash,
+        cap_check_result: cap,
+        hitl_status: cap.hitl_status,
+        final_action: "execute_denied_hitl",
+        output: { error: reason },
+      });
+      return { ok: false, dex, error: reason, cap, cycle_id: ticket.cycle_id };
     }
 
     log.trade(
       "COORD",
-      `[${tier.toUpperCase()}] routing ${p.side} ${p.amountTon} TON jett=${p.jettonMaster.slice(0, 8)}… via ${dex}`,
+      `[${tier.toUpperCase()}] routing ${p.side} ${p.amountTon} TON jett=${p.jettonMaster.slice(0, 8)}… via ${dex} hash=${cap.ticket_hash.slice(0, 8)}`,
     );
+
+    decisionJournalStore.append({
+      cycle_id: ticket.cycle_id,
+      agent: "coordinator",
+      input_hash: cap.ticket_hash,
+      cap_check_result: cap,
+      hitl_status: cap.hitl_status,
+      final_action: "execute_submit",
+      output: { dex, side: p.side, amountTon: p.amountTon },
+    });
 
     const res = await executeSwap(this.client, p, tier, dex);
     if (res.ok) {
-      // Refresh cached balance after a swap.
       await this.refreshBalance(tier);
+      decisionJournalStore.append({
+        cycle_id: ticket.cycle_id,
+        agent: "coordinator",
+        input_hash: cap.ticket_hash,
+        final_action: "execute_ok",
+        output: { txHash: res.txHash, amountTokens: res.amountTokens },
+      });
+    } else {
+      decisionJournalStore.append({
+        cycle_id: ticket.cycle_id,
+        agent: "coordinator",
+        input_hash: cap.ticket_hash,
+        final_action: "execute_failed",
+        output: { error: res.error },
+      });
     }
-    return res;
+    return { ...res, cap, cycle_id: ticket.cycle_id };
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -540,39 +763,47 @@ class TierCoordinator {
       return { ok: false, error: `tier ${tier} not initialized`, pipeline };
     }
 
-    // ── Step 4: Validate Risk ──
-    const gate = this.isTradeAllowed(tier, req.amountTon);
-    if (!gate.allowed) {
-      pipeline.step4RiskVerdict = `DENIED: ${gate.reason}`;
-      log.warn("PIPELINE", `[${tier.toUpperCase()}] Step 4 FAIL: ${gate.reason}`);
-      return { ok: false, error: gate.reason, pipeline };
+    // ── Step 4: Validate Risk via SafetyCaps (hard gates + journal) ──
+    const cycleId = newId("cycle");
+    const plannedTon = (() => {
+      const allocCheck = checkPortfolioAllocation(req.amountTon, handle.balanceTon);
+      if (!allocCheck.allowed && allocCheck.maxAllowedTon !== undefined) {
+        return Math.min(req.amountTon, allocCheck.maxAllowedTon);
+      }
+      return req.amountTon;
+    })();
+    const ticket = this.buildTradeTicket(tier, { ...req, amountTon: plannedTon }, { cycleId });
+    const cap = this.authorizeForTier(tier, ticket);
+    if (!cap.ok) {
+      const reason = cap.failures.map((f) => f.reason).join("; ") || "cap denied";
+      pipeline.step4RiskVerdict = `DENIED: ${reason}`;
+      log.warn("PIPELINE", `[${tier.toUpperCase()}] Step 4 FAIL: ${reason}`);
+      return { ok: false, error: reason, pipeline };
     }
-
-    // Check portfolio allocation (max 5% of available balance)
-    const allocCheck = checkPortfolioAllocation(req.amountTon, handle.balanceTon);
-    if (!allocCheck.allowed) {
-      pipeline.step4RiskVerdict = `DENIED: ${allocCheck.reason}`;
-      log.warn("PIPELINE", `[${tier.toUpperCase()}] Step 4 FAIL: ${allocCheck.reason}`);
-      return { ok: false, error: allocCheck.reason, pipeline };
+    if (cap.hitl_required && cap.hitl_status !== "approved") {
+      const reason = `HITL required (status=${cap.hitl_status})`;
+      pipeline.step4RiskVerdict = `DENIED: ${reason}`;
+      log.warn("PIPELINE", `[${tier.toUpperCase()}] Step 4 FAIL: ${reason}`);
+      return { ok: false, error: reason, pipeline };
     }
     pipeline.step4RiskVerdict = "PASS";
-    log.ok("PIPELINE", `[${tier.toUpperCase()}] Step 4 (Validate Risk) PASS`);
+    log.ok("PIPELINE", `[${tier.toUpperCase()}] Step 4 (Validate Risk) PASS hash=${cap.ticket_hash.slice(0, 8)}`);
 
-    // ── Step 5: Plan Trade (apply allocation cap, determine path) ──
-    const plannedTon = Math.min(req.amountTon, allocCheck.maxAllowedTon ?? req.amountTon);
+    // ── Step 5: Plan Trade ──
     pipeline.step5PlannedSizeTon = plannedTon;
     log.info("PIPELINE", `[${tier.toUpperCase()}] Step 5 (Plan) size=${plannedTon}TON`);
 
     // ── Step 6: Simulate TX ──
     const simulatedReq: SwapRequest = { ...req, amountTon: plannedTon };
-    // The DEX router simulates internally (getSwapTonToJettonTxParams / pool reserves)
-    // We log the intent here; actual simulation happens inside executeSwap
-    // Slippage validation is applied after execution via checkSlippage on the result
     pipeline.step6SimResult = `simulating ${plannedTon}TON → ${req.jettonMaster.slice(0, 8)}…`;
     log.info("PIPELINE", `[${tier.toUpperCase()}] Step 6 (Simulate) ${pipeline.step6SimResult}`);
 
-    // ── Step 7: Execute Swap ──
-    const swapResult = await this.executeForTier(tier, simulatedReq, dex);
+    // ── Step 7: Execute Swap (bound to cap ticket_hash) ──
+    const swapResult = await this.executeForTier(tier, simulatedReq, dex, {
+      ticket,
+      ticketHash: cap.ticket_hash,
+      cycleId,
+    });
     pipeline.step7SwapResult = swapResult;
 
     if (!swapResult.ok) {

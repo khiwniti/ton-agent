@@ -16,6 +16,13 @@ import type { TierRiskConfig } from "../risk/guardrails";
 export type Tier = "low" | "mid" | "high";
 export const ALL_TIERS: Tier[] = ["low", "mid", "high"];
 
+/**
+ * TON headroom reserved on every buy for gas + forward fees + slippage so a
+ * trade that just fits the balance at sign-time doesn't fail mid-broadcast.
+ * A jetton buy on Ston.fi/DeDust forwards ~0.2–0.25 TON; 0.3 is the safe floor.
+ */
+export const GAS_CUSHION_TON = 0.3;
+
 export interface TierHandle {
   tier: Tier;
   /** Optional — callable without these for pure tests. */
@@ -78,12 +85,14 @@ export function evaluateTradeGate(input: TradeGateInput): TradeGateResult {
       reason: `requested ${requestedTon} > tier cap ${handle.config.maxPositionTon}`,
     };
   }
-  // 0.01 TON cushion for gas + slippage so a trade that fits balance at sign-time
-  // doesn't fail mid-broadcast.
-  if (handle.balanceTon < requestedTon + 0.01) {
+  // Reserve GAS_CUSHION_TON on top of the position so the buy doesn't fail
+  // mid-broadcast on gas/forward fees. The reason string reports the exact
+  // threshold the code checks (previously it lied — checked +0.01, said +0.3).
+  const needTon = requestedTon + GAS_CUSHION_TON;
+  if (handle.balanceTon < needTon) {
     return {
       allowed: false,
-      reason: `insufficient balance ${handle.balanceTon} < ${requestedTon + 0.3}`,
+      reason: `insufficient balance ${handle.balanceTon} < ${needTon}`,
     };
   }
   if (handle.openPositions >= handle.config.maxOpen) {

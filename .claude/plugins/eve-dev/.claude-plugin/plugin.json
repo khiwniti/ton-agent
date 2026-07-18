@@ -1,0 +1,5 @@
+{
+  "name": "eve-dev",
+  "description": "Agents for building durable, filesystem-first agents with the Eve framework (eve.dev).",
+  "version": "0.1.0"
+}

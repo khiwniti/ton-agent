@@ -20,6 +20,21 @@ import * as audit from "../security/audit";
 import { getCoordinator, isCoordinatorStarted, ALL_TIERS, type Tier } from "../core/coordinator";
 import { positionsStore } from "../storage/store";
 import { newId } from "@ton-agent/shared";
+import { TIER_RISK_CONFIGS } from "../risk/guardrails";
+
+/**
+ * Phase 4 — per-tier TimeExit deadline (ms) read at position-entry time.
+ *
+ * Honours FR-013: the default is 0 (disabled), so an unsuspecting operator
+ * sees zero behavioural change. Setting e.g. `LOW_MAX_HOLD_MS=1800000`
+ * limits LOW-tier positions to 30 minutes; the monitor then flips them to
+ * CLOSED on the first tick past the deadline (spec 002 §8.5 TimeExit).
+ */
+const tierMaxHoldMs = (tier: Tier): number => {
+    const envKey = `${tier.toUpperCase()}_MAX_HOLD_MS`;
+    const v = parseFloat(process.env[envKey] || "");
+    return Number.isFinite(v) && v > 0 ? v : 0;
+};
 
 // ─────────────────────────────── 1. WALLET BALANCE ───────────────────────────────
 export const getWalletBalanceTool = tool(
@@ -59,29 +74,73 @@ export const auditJettonTool = tool(
 
 // ─────────────────────────────── 3. SWAP EXECUTE ───────────────────────────────
 export const executeSwapTool = tool(
-    async ({ jettonMaster, amountTon, dex: dexName, side, tier }) => {
+    async ({
+        jettonMaster,
+        amountTon,
+        dex: dexName,
+        side,
+        tier,
+        cycleId,
+        ticketHash,
+        riskVerdict,
+        poolTvlTon,
+        slippagePct,
+        aiScore,
+    }) => {
         log.banner("EXECUTE", `tier=${tier ?? "low"} side=${side} amount=${amountTon} TON jetton=${jettonMaster}`);
 
         // Resolve tier (default 'low' for backward compat).
         const resolvedTier = (tier ?? "low") as Tier;
 
-        // Route through the coordinator so kill-switch / circuit-breaker / bankroll gates fire.
+        // Route through the coordinator so SafetyCaps + kill-switch / bankroll fire.
         // Bypassing the coordinator is NOT allowed — it would lose risk protection.
         if (!isCoordinatorStarted()) {
             return { ok: false, error: "TierCoordinator not started — boot the agent first" };
         }
         const coord = getCoordinator();
 
-        const r = await coord.executeForTier(resolvedTier, {
-            jettonMaster,
-            amountTon,
-            side,
-        }, dexName);
-        return { ...r, tier: resolvedTier };
+        const risk =
+            riskVerdict
+                ? {
+                      score: riskVerdict === "pass" ? 80 : riskVerdict === "caution" ? 50 : 0,
+                      verdict: riskVerdict as "pass" | "caution" | "reject",
+                  }
+                : null;
+
+        const r = await coord.executeForTier(
+            resolvedTier,
+            {
+                jettonMaster,
+                amountTon,
+                side,
+            },
+            dexName,
+            {
+                cycleId,
+                ticketHash,
+                risk,
+                poolTvlTon,
+                slippagePct,
+                aiScore,
+            },
+        );
+        return {
+            ...r,
+            tier: resolvedTier,
+            // Surface cap outcome so the model cannot ignore a denial.
+            cap_ok: r.cap?.ok,
+            ticket_hash: r.cap?.ticket_hash ?? r.cycle_id,
+            hitl_required: r.cap?.hitl_required,
+        };
     },
     {
         name: "execute_swap",
-        description: "Execute a real signed BUY or SELL on Ston.fi or DeDust through the tier coordinator. Tier 'high' requires promotion unlock. The coordinator enforces kill-switch, circuit breaker, tier position caps, and bankroll checks BEFORE signing. Losses can be 100% of amountTon — verify size thrice.",
+        description:
+            "Execute a real signed BUY or SELL on Ston.fi or DeDust through the tier coordinator. " +
+            "Every call runs deterministic SafetyCaps (kill-switch, circuit breaker, tier caps, allocation, optional depth/slippage/risk verdict) before signing. " +
+            "Optional ticketHash must match a previously issued SafetyCaps authorization for the same ticket. " +
+            "riskVerdict=reject always denies; caution requires HITL (not auto-executable until Telegram approval lands). " +
+            "Losses can be 100% of amountTon — verify size thrice.",
         schema: z.object({
             jettonMaster: z.string(),
             amountTon: z.number().positive().max(50, "cap to 50 TON until risk profile grows"),
@@ -89,6 +148,18 @@ export const executeSwapTool = tool(
             side: z.enum(["buy", "sell"]).default("buy"),
             tier: z.enum(["low", "mid", "high"]).default("low")
                 .describe("Risk tier wallet to route the swap through. 'high' is promotion-gated."),
+            cycleId: z.string().optional()
+                .describe("Optional cycle id for the decision journal; auto-minted if omitted."),
+            ticketHash: z.string().optional()
+                .describe("Optional SafetyCaps ticket_hash from a prior authorize step; must match live ticket."),
+            riskVerdict: z.enum(["pass", "caution", "reject"]).optional()
+                .describe("Advisory risk verdict from audit/risk step. reject blocks; caution forces HITL."),
+            poolTvlTon: z.number().positive().optional()
+                .describe("Pool TVL in TON for liquidity-depth gate."),
+            slippagePct: z.number().nonnegative().optional()
+                .describe("Quoted slippage percent for the slippage cap."),
+            aiScore: z.number().min(0).max(100).optional()
+                .describe("Optional AI confidence score vs tier minAiScore."),
         }),
     }
 );
@@ -276,6 +347,16 @@ export const recordPositionTool = tool(
             cost_basis_ton: costBasisTon,
             confidence_score: confidenceScore ?? 0,
             status: "OPEN",
+            // Phase 4 hot-path exit state — populate at entry so TimeExit can fire.
+            // max_hold_ms comes from a per-tier env default (0/unset = disabled),
+            // keeping TimeExit opt-in and behaviour-neutral for existing positions.
+            // exit_by_ms is the denormalised deadline (= entry_at + max_hold_ms)
+            // the monitor reads on every tick without recomputing.
+            max_hold_ms: tierMaxHoldMs(walletTier),
+            exit_by_ms: (() => {
+                const m = tierMaxHoldMs(walletTier);
+                return m && m > 0 ? now + m : null;
+            })(),
         } as any;
 
         try {

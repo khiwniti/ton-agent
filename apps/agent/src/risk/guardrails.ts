@@ -13,23 +13,37 @@ export interface TierRiskConfig {
   minAiScore: number;
 }
 
+/**
+ * Per-tier absolute position caps (in TON), env-overridable.
+ *
+ * IMPORTANT: a cap MUST exceed `GAS_CUSHION_TON` (see gate.ts) or no trade in
+ * that tier can ever clear the bankroll check — a self-locking contradiction.
+ * The prior dust defaults (0.02/0.05/0.1) did exactly that. Defaults below
+ * follow the tiered-proven model: LOW builds the port with small size, MID
+ * scales, HIGH accelerates once promotion unlocks.
+ */
+const capTon = (k: string, fb: number) => {
+  const v = parseFloat(process.env[k] || "");
+  return Number.isFinite(v) && v > 0 ? v : fb;
+};
+
 export const TIER_RISK_CONFIGS: Record<"low" | "mid" | "high", TierRiskConfig> = {
   low: {
-    maxPositionTon: 0.02,
+    maxPositionTon: capTon("LOW_MAX_POSITION_TON", 1.0),
     maxOpen: 2,
     takeProfitPct: 25,
     stopLossPct: 15,
     minAiScore: 80,
   },
   mid: {
-    maxPositionTon: 0.05,
+    maxPositionTon: capTon("MID_MAX_POSITION_TON", 3.0),
     maxOpen: 3,
     takeProfitPct: 60,
     stopLossPct: 25,
     minAiScore: 65,
   },
   high: {
-    maxPositionTon: 0.1,
+    maxPositionTon: capTon("HIGH_MAX_POSITION_TON", 5.0),
     maxOpen: 4,
     takeProfitPct: 150,
     stopLossPct: 40,

@@ -1,0 +1,1089 @@
+## User
+
+# GRAM Autonomous Trading Framework
+## Agent Orchestration Architecture Specification
+
+| | |
+|---|---|
+| **Document type** | Design specification (implementation-ready) |
+| **System** | GRAM Autonomous TON Trading Bot — Orchestration Layer |
+| **Chain** | The Open Network (TON), native asset GRAM (rebranded from Toncoin, effective 2026-06-15) |
+| **Status** | Draft v1.0 — for engineering review |
+| **Builds on** | Existing SafetyCaps, rug-detection, prompt-sanitization, and exit-policy modules (41 passing tests) |
+| **Date** | 2026-07-16 |
+
+---
+
+## 1. Executive Summary
+
+This specification defines the **agent orchestration layer** that sits above the trading system's existing safety-critical modules and turns them into a coherent, autonomous, Telegram-native trading system on TON. It answers four questions precisely enough to hand to an implementer:
+
+1. **How are agents structured and coordinated?** — A LangGraph *Deep Agents*-pattern supervisor graph, with specialist sub-agents invoked as tools.
+2. **Where does chain custody and execution live?** — TON's native **Agentic Wallets** primitive plus `@ton/mcp`, giving each strategy a non-custodial, balance-scoped wallet instead of a shared hot wallet.
+3. **How is the system kept from destroying itself?** — A deterministic **SafetyCaps** core (position sizing, circuit breakers, exit policy) that the LLM layer cannot override, only propose into.
+4. **How is it operated safely by one person?** — A Telegram approval surface with a risk-tiered human-in-the-loop (HITL) escalation matrix, full decision journaling, and staged environment promotion (testnet-paper → mainnet-live-capped → mainnet-live-full).
+
+The central architectural bet of this document is a **separation of authority**: LLM agents *reason, research, and propose*; a small, deterministic, heavily-tested code core *authorizes and executes*. This mirrors the emerging industry consensus that prompt injection is unsolved at the model layer in 2026 and must be *contained*, not filtered — the containment boundary in this system is the SafetyCaps core, and no agent output crosses it without passing through non-LLM code.
+
+---
+
+## 2. Scope & Design Goals
+
+**In scope:**
+- Orchestration topology for market scanning, risk analysis, strategy formation, execution, monitoring, and exit on TON DEXs (STON.fi, DeDust, and aggregators).
+- Integration contract with `@ton/mcp` (official TON Foundation MCP server) and TON's Agentic Wallets standard.
+- The SafetyCaps deterministic risk core: position sizing, exposure limits, circuit breakers, rug/honeypot screening, prompt-injection containment, exit policy.
+- Telegram interface contract (commands, notifications, approval UX).
+- Observability, decision journaling, and test/promotion gates.
+- Threat model and mitigations specific to TON/GRAM in mid-2026.
+
+**Design goals, in priority order:**
+1. **Capital cannot be lost faster than a human can intervene.** Every path to a signed transaction passes through a deterministic cap check.
+2. **No single LLM call can move funds.** LLM output is a *proposal*, never an *authorization*.
+3. **Every decision is reconstructable after the fact** from an append-only journal — what was seen, what was reasoned, what was authorized, what executed.
+4. **Fail closed.** Any missing data, timeout, ambiguous risk signal, or infra failure defaults to *no trade*, not *best guess*.
+5. **Operable by one person from a phone**, via Telegram, without needing to SSH in during normal operation.
+
+---
+
+## 3. Non-Goals
+
+- This is not a general-purpose TON wallet or a consumer product — single-operator system, not multi-tenant.
+- Not a market-making or MEV-extraction system; it is a directional spot-trading agent for jettons on TON DEXs.
+- Not attempting to defend against a fully compromised host machine (OS/container hardening is assumed, not re-specified here).
+- Not covering the internal implementation details of the already-built rug-detection heuristics, prompt-sanitization filters, or exit-policy math — this document specifies their *place in the architecture and their interfaces*, not their internals (those live in the existing module suite).
+
+---
+
+## 4. System Context
+
+```mermaid
+flowchart LR
+    OP((Operator<br/>Khiw)) <--> TG[Telegram Bot]
+    TG <--> ORC[Orchestration Layer]
+    ORC <--> SC[SafetyCaps Core]
+    SC <--> MCP["@ton/mcp<br/>Agentic Wallet"]
+    MCP <--> RPC[RPC Providers<br/>Toncenter / Orbs / GetBlock]
+    RPC <--> TON[(TON Blockchain)]
+    MCP <--> DEX[STON.fi / DeDust / Omniston]
+    ORC <--> LLM[LLM Provider<br/>Anthropic API]
+    ORC <--> MD[Market Data Sources<br/>DEX Screener / GeckoTerminal / on-chain indexers]
+    SC <--> JRN[(Decision Journal<br/>append-only)]
+    ORC <--> TRC[Tracing / Observability]
+```
+
+**Actors:**
+
+| Actor | Role |
+|---|---|
+| Operator | Sole human principal; sets caps, approves high-tier trades, owns the master TON wallet that funds agentic sub-wallets |
+| Telegram | Interface surface; also acts as the HITL approval channel |
+| Orchestration layer | LangGraph Deep Agents supervisor + sub-agents |
+| SafetyCaps core | Deterministic Python authorization layer — the only thing allowed to greenlight a signed transaction |
+| `@ton/mcp` | TON Foundation's official MCP server; holds/operates the agentic wallet(s), builds and signs intents |
+| RPC providers | Toncenter API v2 (primary), Orbs TON Access (decentralized fallback), GetBlock/OnFinality (paid fallback) |
+| DEXs / aggregators | STON.fi, DeDust, Omniston (multi-DEX RFQ aggregation) |
+| LLM provider | Anthropic API — Claude models for reasoning/planning agents |
+
+---
+
+## 5. Architectural Principles
+
+These six principles are load-bearing; every design decision below traces back to one of them.
+
+**P1 — Deterministic risk core, probabilistic reasoning shell.**
+LLM agents plan, research, and score. They never hold a signing key, never call a DEX router directly, and never bypass SafetyCaps. This is the same pattern independently converged on across current agentic-trading builds: the model is the *architect* of the strategy and risk logic (design-time), not necessarily the *executor* of every individual trade (run-time) — ordinary, auditable, fast code enforces the boundary at run-time. In this system a live LLM *is* in the reasoning loop for market judgment (rug screening nuance, narrative risk, entry timing), but it is architecturally incapable of being the last step before a signature.
+
+**P2 — Least-privilege custody via Agentic Wallets.**
+TON Tech's Agentic Wallets standard gives each agent a dedicated, non-custodial, balance-scoped on-chain wallet funded by the operator's main wallet — the agent can transact only within its allocated balance, with no private-key handoff. This is used as the custody primitive instead of a single shared hot wallet: a compromised or misbehaving strategy can only lose what it was allocated, never the treasury.
+
+**P3 — Containment, not filtering, against prompt injection.**
+Since prompt injection is treated industry-wide in 2026 as unsolved at the model layer, this system does not attempt to guarantee that injected content will be detected. Instead every tool an agent can call is scoped to the minimum privilege it needs, every high-impact action requires a non-LLM check, and a five-layer sanitization pipeline (§10.4) reduces — but does not solely rely on reducing — the chance an injection lands.
+
+**P4 — HITL intensity scales with capital at risk**, not with system complexity. A ฿50 scan-and-log action needs no approval; a trade above the auto-approve ceiling always needs a Telegram tap, regardless of how confident the agent is.
+
+**P5 — Everything is journaled.** Every LLM call, every tool call, every cap check, every rejection, and every fill is written to an append-only decision journal before the next step proceeds. If it isn't journaled, it didn't happen, as far as the system is concerned for post-mortems.
+
+**P6 — Fail closed.** Timeouts, missing RPC data, ambiguous rug scores, and unhandled exceptions all resolve to *do not trade* / *exit if already in position*, never to a default "proceed."
+
+---
+
+## 6. High-Level Architecture
+
+```mermaid
+flowchart TB
+    subgraph L1[" Interface Layer "]
+        TG["Telegram Bot (aiogram)"]
+    end
+    subgraph L2[" Orchestration Layer — LangGraph Deep Agents "]
+        SUP[Supervisor Graph]
+        MS[Market Scanner Agent]
+        RA[Rug / Risk Analyst Agent]
+        SA[Strategy Agent]
+        EA[Execution Agent]
+        PJ[Postmortem / Journal Agent]
+    end
+    subgraph L3[" SafetyCaps — Deterministic Risk Core "]
+        CAP[Position & Exposure Caps]
+        CB[Circuit Breaker / Kill Switch]
+        SAN[Prompt Sanitizer]
+        EXIT[Exit Policy Engine]
+        HITL[HITL Gate]
+    end
+    subgraph L4[" TON Integration Layer "]
+        MCP["@ton/mcp — Agentic Wallet(s)"]
+        RPC["RPC Pool: Toncenter / Orbs / GetBlock"]
+        DEX["STON.fi / DeDust / Omniston"]
+    end
+    subgraph L5[" Data & Observability "]
+        JRN[(Decision Journal)]
+        TRC[Tracing]
+        MET[Metrics & Alerts]
+    end
+
+    TG <--> SUP
+    SUP --> MS
+    SUP --> RA
+    SUP --> SA
+    SUP --> EA
+    SUP --> PJ
+    SAN --> SUP
+    MS --> CAP
+    RA --> CAP
+    SA --> CAP
+    CAP --> HITL
+    HITL --> CB
+    CB --> EA
+    EXIT --> EA
+    EA --> MCP
+    MCP --> RPC
+    RPC --> DEX
+    SUP --> JRN
+    SUP --> TRC
+    CB --> MET
+```
+
+Five layers, top to bottom:
+
+| Layer | Responsibility | Trust level |
+|---|---|---|
+| Interface (Telegram) | Human I/O, approvals, notifications | Untrusted input channel — always sanitized |
+| Orchestration (LangGraph Deep Agents) | Plan, research, propose | Reasoning only — no signing authority |
+| SafetyCaps (deterministic) | Authorize, throttle, halt | Ground truth — final word before execution |
+| TON Integration (`@ton/mcp`) | Sign, submit, read chain state | Mechanical — executes only pre-authorized tickets |
+| Data & Observability | Record, trace, alert | Passive — write-mostly |
+
+---
+
+## 7. Orchestration Layer (LangGraph Deep Agents)
+
+### 7.1 Framework choice & rationale
+
+| Framework | Fit for this system | Verdict |
+|---|---|---|
+| **LangGraph + Deep Agents** | Graph-based state machine with checkpointing, native human-in-the-loop interrupts (`interrupt_before`), and a Deep Agents layer providing todo-based planning, a virtual file system for agent memory, and sub-agents callable as ordinary tools. Any compiled sub-graph can be wrapped as a tool for a parent supervisor. | **Selected** — already the direction of the existing GRAM bot codebase |
+| CrewAI | Fastest to prototype (~20 lines for a crew), but coarser state control; teams commonly migrate off it once edge cases need fine-grained conditional routing — exactly this system's requirement (risk gates, HITL branches, exit interrupts). | Rejected for orchestration; fine for throwaway prototyping |
+| AutoGen / AG2 | Strong for open-ended multi-agent conversation; weaker on the compiled, resumable state-machine guarantees this system needs for auditability. | Rejected |
+| Raw ReAct single-agent loop | Cannot hold multi-step plans, loses context on long scans, no native HITL interrupt. | Rejected |
+
+**Cost note:** a supervisor-of-specialists pattern costs roughly 3× a single mega-agent call because every routing decision is itself an LLM turn. This system accepts that cost only where it buys a real safety or quality benefit (rug analysis, strategy formation) and uses a **cheaper/faster model tier for high-frequency, low-ambiguity tool-calling agents** (market scanning, formatting) and a **frontier reasoning tier** only for the supervisor and the risk analyst.
+
+### 7.2 Orchestrator graph topology
+
+```mermaid
+flowchart TD
+    START([Scheduler Tick / Telegram Command]) --> SUP{Supervisor}
+    SUP -->|scan market| MS[Market Scanner subgraph]
+    MS --> SUP
+    SUP -->|candidate jetton| RA[Rug / Risk Analyst subgraph]
+    RA -->|risk score + verdict| SUP
+    SUP --> GATE{Risk Gate}
+    GATE -->|reject| LOG1[Log & Discard]
+    GATE -->|pass| SA[Strategy Agent<br/>sizing + entry/exit plan]
+    SA --> SUP
+    SUP -->|proposed trade ticket| CAPCHK{SafetyCaps<br/>Deterministic Check}
+    CAPCHK -->|fail| LOG2[Log & Discard]
+    CAPCHK -->|pass, below auto-limit| EA[Execution Agent]
+    CAPCHK -->|pass, above auto-limit| HITL[Telegram Approval Request]
+    HITL -->|approved| EA
+    HITL -->|denied / timeout| LOG3[Log & Discard]
+    EA --> MCPX[("@ton/mcp Agentic Wallet")]
+    MCPX --> CHAIN[(TON Blockchain)]
+    EA --> JRNX[(Decision Journal)]
+    EA --> MON[Position Monitor]
+    MON -->|exit condition met| EXITP[Exit Policy Engine]
+    EXITP --> EA
+```
+
+This is a **plan-then-execute** topology with an explicit risk gate and an explicit cap check as separate graph nodes — not folded into agent reasoning — so both are independently unit-testable and cannot be "reasoned around" by a persuasive prompt.
+
+### 7.3 Agent roster
+
+| Agent | Responsibility | Tools it may call | Model tier | Can it authorize a trade? |
+|---|---|---|---|---|
+| **Supervisor** | Routes between specialists, holds top-level plan (todo list via Deep Agents planning tool), decides when a cycle is complete | Sub-agents as tools, journal writer | Frontier | No |
+| **Market Scanner** | Pulls trending/new pools from DEX Screener-style sources and on-chain indexers, filters by liquidity/age/volume thresholds | Read-only market-data tools | Cheap/fast | No |
+| **Rug / Risk Analyst** | Scores a candidate jetton: LP-lock status, holder concentration, mint/blacklist authority, TVL trajectory, contract verification, creator wallet history | Read-only chain tools (`@ton/mcp` balance/jetton-info calls), rug-detection module (existing) | Frontier (nuanced judgment) | No — advisory score only |
+| **Strategy Agent** | Given a passed candidate, proposes position size (within caps), entry method, stop-loss/take-profit/trailing parameters | Sizing calculators, exit-policy config reader | Frontier | No — proposes a *ticket*, not an authorization |
+| **Execution Agent** | Converts an *authorized* ticket into a signed intent via `@ton/mcp`, submits, confirms | `@ton/mcp` transact tools only | Cheap/fast (deterministic tool-calling, minimal reasoning) | Executes only after SafetyCaps + (if required) HITL sign-off |
+| **Position Monitor** | Polls open positions against exit-policy thresholds | Read-only price/chain tools | Cheap/fast, high frequency, largely non-LLM | No |
+| **Postmortem / Journal Agent** | Periodically summarizes closed trades into human-readable Telegram digests | Journal reader | Cheap/fast | No |
+
+### 7.4 State schema
+
+The graph state is a single typed object threaded through every node — this is what gets checkpointed, journaled, and inspected during HITL pauses.
+
+```python
+class GramTradeState(TypedDict):
+    cycle_id: str
+    candidate: JettonCandidate | None
+    risk_assessment: RiskAssessment | None      # from Rug/Risk Analyst
+    proposed_ticket: TradeTicket | None          # from Strategy Agent
+    cap_check_result: CapCheckResult | None      # from SafetyCaps — authoritative
+    hitl_status: Literal["not_required", "pending", "approved", "denied", "timeout"]
+    execution_result: ExecutionResult | None
+    open_positions: list[Position]
+    todo_plan: list[TodoItem]                    # Deep Agents planning surface
+    journal_ref: str                              # pointer into append-only journal
+```
+
+`RiskAssessment`, `TradeTicket`, and `CapCheckResult` are separate types deliberately: a `TradeTicket` proposed by the Strategy Agent is *not itself authorization* — it only becomes actionable once wrapped in a `CapCheckResult` produced by non-LLM code.
+
+### 7.5 Planning, memory, and sub-agent isolation
+
+Following the Deep Agents pattern already in use, the Supervisor maintains a todo-style plan for each trading cycle and writes intermediate artifacts (candidate lists, risk notes, draft tickets) to a virtual file system rather than stuffing everything into a single growing context window. Each specialist sub-agent is a complete, independently-checkpointed sub-graph invoked as a tool by the Supervisor — this means the Rug/Risk Analyst can be upgraded, re-prompted, or swapped for a different model without touching the Execution Agent, and a failure or infinite loop in one specialist cannot corrupt another's state.
+
+### 7.6 Human-in-the-loop interrupts
+
+LangGraph's `interrupt_before` mechanism is used at exactly two points in the graph: **before** the Execution Agent node when a ticket exceeds the auto-approve ceiling, and **before** any action that would change SafetyCaps configuration itself (raising a cap requires explicit operator approval, never agent-proposed). The checkpointer persists full state at the interrupt, so approval can arrive minutes or hours later via Telegram without losing context, and a rejected or timed-out interrupt resumes into the "discard and log" branch, never into a default-proceed branch (per P6).
+
+---
+
+## 8. TON Blockchain Integration Layer
+
+### 8.1 `@ton/mcp` tool surface
+
+`@ton/mcp` is TON's official Model Context Protocol server (currently alpha; built on `@ton/walletkit`), exposed to the orchestration layer as a standard MCP tool set:
+
+| Capability | Tool family | Used by |
+|---|---|---|
+| Balance / history queries | `getBalance`, `getJettonBalance`, `getTransactionHistory` | Rug/Risk Analyst, Position Monitor, Strategy Agent |
+| Jetton/NFT transfers | `transfer` | Execution Agent (exit/rebalance) |
+| DEX swap quotes & execution | `getSwapQuote`, `swap` (via DEX aggregators) | Execution Agent |
+| Wallet/session management | agentic wallet creation, operator key rotation, wallet import | Ops tooling (operator-invoked only, never autonomous) |
+
+Two transport modes are relevant: **stdio** for the local orchestration process, and **HTTP (multi-session)** if the orchestration layer is later split across processes/containers. Serverless deployment (`@ton/mcp/serverless`) is noted as a future option for a Cloudflare Workers-hosted execution shim, consistent with the existing Cloudflare-first infrastructure preference, but is **not** the Phase 1 default because it complicates key custody.
+
+Because `@ton/mcp` is alpha, this system pins an exact package version per environment and requires a changelog review before any version bump — treated as a supply-chain-risk item in §15.
+
+### 8.2 Custody model — Agentic Wallets
+
+TON Tech's **Agentic Wallets** standard is the custody backbone: each strategy/agent gets a dedicated, non-custodial, on-chain wallet, funded and scoped by the operator's main wallet, with no private-key handoff to the agent process — the agent can only transact within its allocated balance. This directly implements P2 (least-privilege custody) at the protocol level rather than only in application code:
+
+- **Master wallet** (operator-controlled, cold/hardware-backed where possible): funds agentic sub-wallets, never touched by the orchestration layer.
+- **Strategy sub-wallet(s)**: one per active strategy or risk tier, each capped at a maximum allocated balance set by the operator. A compromised or malfunctioning agent can drain at most one sub-wallet's balance, not the treasury.
+- **Refill policy**: sub-wallets are topped up manually or via a scheduled, operator-approved transfer — never autonomously by the trading agents themselves.
+
+### 8.3 Wallet contract selection by role
+
+| Wallet role | Contract | Rationale |
+|---|---|---|
+| Master / treasury | Multisig (N-of-M) | Highest security for the wallet nothing else can touch |
+| Strategy sub-wallet (normal trading) | **v5r1** | Current recommended standard; supports gasless flows and gives operator recovery/delegation options |
+| Batch operations (portfolio rebalance, multi-position exit sweep) | **Highload Wallet v3** | Purpose-built for many parallel outgoing messages via query-id based replay protection instead of sequential seqno — avoids the sequential bottleneck of v4/v5 when exiting multiple positions at once (e.g., during a circuit-breaker halt) |
+
+### 8.4 RPC / data-layer redundancy
+
+A single RPC dependency is a single point of failure for a system that needs to detect exit conditions in real time. The integration layer runs a **provider pool with health-checked failover**, not a single endpoint:
+
+| Tier | Provider | Role |
+|---|---|---|
+| Primary | Toncenter API v2 | Default, most widely supported |
+| Decentralized fallback | Orbs Network TON Access | No API key, no single centralized dependency, dozens of independent PoS-staked validators — used automatically if primary is rate-limited or down |
+| Paid fallback | GetBlock / OnFinality (or equivalent) | SLA-backed tier for sustained high-frequency polling during active position monitoring |
+
+Failover logic: read calls (balance, price, pool state) round-robin across the pool with circuit-breaking per provider (if a provider errors N times in a window, it's temporarily excluded); write calls (transaction submission) always go through the primary unless it is confirmed down, and a failed submission is retried through the fallback with idempotency via the transaction's own hash — never blindly re-signed.
+
+### 8.5 DEX & liquidity routing
+
+STON.fi and DeDust are the two dominant TON DEXs and the primary execution venues; STON.fi generally carries deeper TVL and is the default for blue-chip/major pairs, while DeDust often wins on niche jetton pairs and specialty pool types. Rather than hard-coding a single DEX, the Execution Agent queries both (and, where available, an aggregator such as STON.fi's Omniston RFQ router) for a quote, and SafetyCaps enforces a **maximum acceptable slippage** and a **minimum liquidity-depth-to-trade-size ratio** independent of which venue is chosen — this prevents an agent from routing into a thin pool just because it quoted a marginally better headline price.
+
+---
+
+## 9. SafetyCaps — Deterministic Risk & Safety Core
+
+This is the layer that makes the rest of the system safe to leave running unattended. Every sub-section below corresponds to an existing or planned module; this document specifies the **contract** each module exposes to the orchestration layer, not its internal implementation.
+
+### 9.1 Position & exposure caps
+
+Deterministic, config-driven, and checked in plain Python with no LLM call in the critical path:
+
+| Parameter | Example default | Enforced against |
+|---|---|---|
+| Max position size | % of strategy sub-wallet balance per trade | Every proposed ticket |
+| Max exposure per token | % of sub-wallet balance | Sum of open positions in that jetton |
+| Max concurrent open positions | integer count | Live position count |
+| Max daily loss (circuit-breaker trigger) | % of sub-wallet balance in rolling 24h | Realized + unrealized PnL |
+| Max single-trade slippage | basis points | Quoted vs. executed price |
+| Min liquidity-depth ratio | trade size ≤ X% of pool TVL | Pool state at execution time |
+
+Any proposed ticket that fails **any** check is rejected outright — checks are not weighted or averaged; this is a hard gate, not a scoring function.
+
+### 9.2 Circuit breaker / kill switch
+
+```mermaid
+stateDiagram-v2
+    [*] --> Active
+    Active --> Throttled: daily_loss > warn_threshold
+    Throttled --> Active: daily_loss resets (UTC rollover)
+    Throttled --> Halted: daily_loss > hard_threshold
+    Active --> Halted: infra_anomaly (RPC failure streak, price feed divergence)
+    Active --> Halted: manual_operator_halt (Telegram /halt)
+    Halted --> Active: manual_operator_resume (Telegram /resume, explicit confirmation)
+    Halted --> EmergencyExit: rug_signal on open position
+    EmergencyExit --> Halted
+```
+
+- **Active**: normal operation, all agents may propose trades.
+- **Throttled**: new position sizes are automatically reduced (e.g., halved) and the HITL auto-approve ceiling drops; existing positions continue to be monitored for exit.
+- **Halted**: no new positions may open under any circumstances, including operator override via chat text — only an explicit `/resume` Telegram command with confirmation reactivates the system. Open positions are still monitored and can still be exited.
+- **Emergency exit**: if a rug/risk re-assessment on an *already open* position crosses a critical threshold, the exit-policy engine is invoked directly regardless of circuit-breaker state — getting out of a bad position is never blocked by the halt.
+
+### 9.3 Rug / honeypot detection module
+
+The detection approach follows the two empirically-strongest signal families identified in TON-specific research: a **TVL-trajectory approach** (liquidity added/removed deltas, time-to-first-large-withdrawal, max-TVL-within-N-minutes-of-creation) and an **idle/activity approach** (transaction cadence, unique trader growth), combined — TVL-based features are more informative and stable by AUC across samples, while idle-based features achieve the strongest raw precision for the highest-confidence rejections. In addition to the on-chain ML signal, the module applies the standard rule-based checklist used across the DEX-security tooling ecosystem:
+
+| Check | Signal |
+|---|---|
+| LP lock status | Locked/burned vs. freely withdrawable |
+| Holder concentration | Top-10 wallet share of supply |
+| Mint / blacklist authority | Whether the jetton owner retains mint or transfer-block functions |
+| Contract verification | Source published and matches deployed code |
+| Sell simulation | Small test-sell succeeds without excessive/asymmetric tax |
+| Creator wallet history | Prior association with known rug addresses (behavioral, not just code-level — sophisticated operators write clean code but reuse compromised wallets) |
+| Ticker-collision check (**TON/GRAM-specific**) | Confirms the jetton master address matches the known native-asset identity and is not a lookalike jetton exploiting the June 2026 Toncoin→GRAM rebrand naming confusion |
+
+Output is a `RiskAssessment` with a numeric score and a categorical verdict (`pass` / `caution` / `reject`); only `pass` proceeds to the Strategy Agent automatically, `caution` requires HITL regardless of trade size, `reject` is auto-discarded.
+
+### 9.4 Prompt-injection containment pipeline
+
+Five independent layers, consistent with current defense-in-depth practice, applied to **every** piece of externally-sourced text before it enters an agent's context (token names/descriptions, social sentiment snippets, DEX pool metadata, any Telegram message content that gets relayed into agent context):
+
+1. **Input filtering** — strip zero-width characters, unicode tricks, and known injection-pattern blocklist matches before the text reaches any model.
+2. **Instruction delimiting** — externally-sourced content is always wrapped in structured, clearly-delimited tags distinct from system/operator instructions, so the model has a structural signal for "this is data, not instruction."
+3. **Tool allow-listing per agent** — the Market Scanner and Rug/Risk Analyst, which touch the most untrusted external text, have *no* transact-capable tools available in their tool set at all — an injected instruction has nothing dangerous to invoke even if it "succeeds."
+4. **Output validation** — structured-output schemas (Pydantic) reject any agent response that doesn't conform, catching injected attempts to smuggle instructions into what should be a numeric score or enum verdict.
+5. **Architectural containment (the backstop)** — even a fully successful injection that convinces an agent to "recommend" an oversized or malicious trade still has to pass the non-LLM SafetyCaps gate and, above the auto-approve ceiling, an explicit human tap in Telegram. This layer is why layers 1–4 are defense-in-depth rather than the sole line of defense.
+
+### 9.5 Exit policy engine
+
+State machine per open position (diagram in §7.2 context; detailed below):
+
+```mermaid
+stateDiagram-v2
+    [*] --> Monitoring
+    Monitoring --> TakeProfit: price >= tp_target
+    Monitoring --> StopLoss: price <= sl_floor
+    Monitoring --> TrailingActive: price >= trailing_trigger
+    TrailingActive --> TrailingStop: price falls trailing_pct from local peak
+    TrailingActive --> TakeProfit: price >= tp_target
+    Monitoring --> TimeExit: hold_time >= max_hold_duration
+    Monitoring --> EmergencyExit: rug_reassessment == critical
+    TakeProfit --> Exited
+    StopLoss --> Exited
+    TrailingStop --> Exited
+    TimeExit --> Exited
+    EmergencyExit --> Exited
+    Exited --> [*]
+```
+
+The exit policy is evaluated by the **Position Monitor** on a fast, largely non-LLM polling loop (price checks are arithmetic, not reasoning) — an LLM call is only invoked for `EmergencyExit` re-assessment, which is intentionally the one path that goes back through the Rug/Risk Analyst mid-position.
+
+### 9.6 HITL escalation matrix
+
+| Trade size (% of sub-wallet) | Risk verdict | Approval required |
+|---|---|---|
+| Below auto-approve floor | `pass` | None — auto-executes, logged |
+| Below auto-approve floor | `caution` | Telegram approval, no timeout auto-deny... **times out to deny** (P6) |
+| Above auto-approve ceiling | `pass` | Telegram approval required |
+| Above auto-approve ceiling | `caution` | Telegram approval + explicit risk-note shown, longer review window |
+| Any size | `reject` | Never surfaced for approval — auto-discarded |
+| Cap-configuration change | n/a | Always requires operator-initiated action; never agent-proposed |
+
+---
+
+## 10. Data, Memory & Observability Layer
+
+### 10.1 Market data ingestion
+
+Read-only sources feeding the Market Scanner and Rug/Risk Analyst: DEX-aggregator pool/pair feeds (volume, liquidity, age), on-chain jetton metadata via `@ton/mcp` / TON indexers, and DEX-native APIs (STON.fi, DeDust) for quote depth. All ingestion is cached with a short TTL to bound RPC load and is treated as untrusted text for prompt-injection purposes (§9.4).
+
+### 10.2 Decision journal
+
+Append-only, structured log — the single source of truth for post-mortems and the 41-test-suite-style regression harness. Minimum schema per entry: `cycle_id`, `timestamp`, `agent`, `model_used`, `input_hash`, `tool_calls[]`, `output`, `cap_check_result`, `hitl_status`, `final_action`. Never mutated, only appended; rotated/archived, never deleted, for as long as any related position remains open.
+
+### 10.3 Tracing & observability
+
+LangGraph's native checkpointing gives step-level replayability for free; this is paired with a tracing backend (LangSmith or an OpenTelemetry-compatible equivalent) so that every graph run — including sub-agent invocations — is inspectable end-to-end, which matters both for debugging and as the audit trail referenced in the treatment of prompt-injection risk as a governance/compliance surface, not only a technical one.
+
+### 10.4 Metrics & alerting
+
+Circuit-breaker state transitions, cap-check rejection rates, RPC-provider failover events, and exit-policy triggers are all metric-emitting events routed to the same Telegram channel used for approvals, tiered by severity (info digest vs. immediate alert).
+
+---
+
+## 11. Telegram Interface Layer
+
+### 11.1 Command surface
+
+| Command | Effect | Auth level |
+|---|---|---|
+| `/status` | Current circuit-breaker state, open positions, today's PnL | Operator |
+| `/positions` | Detail view of open positions vs. exit policy | Operator |
+| `/halt` | Immediate circuit-breaker → Halted | Operator |
+| `/resume` | Halted → Active, requires confirmation tap | Operator |
+| `/caps` | View current SafetyCaps parameters (read-only via chat) | Operator |
+| `/setcap <param> <value>` | Propose a cap change | Operator, requires confirmation |
+| `/digest` | On-demand postmortem summary | Operator |
+
+### 11.2 Approval UX
+
+HITL approval requests use Telegram inline-keyboard buttons (Approve / Deny / View Detail), not free-text parsing — this both improves usability on mobile and eliminates an entire class of prompt-injection surface where a maliciously-crafted "approval message" text could otherwise be misparsed. Each approval request includes: jetton identity + explorer link, risk verdict and score, proposed size as % of sub-wallet, quoted slippage, and which cap(s), if any, are near their ceiling.
+
+### 11.3 Notification tiers
+
+`info` (digest-batched), `action` (trade executed, position closed), `warning` (throttled state, cap near ceiling), `critical` (halted, emergency exit fired) — critical and action-required notifications are never batched.
+
+---
+
+## 12. Deployment & Infrastructure
+
+### 12.1 Environment matrix
+
+| Environment | Chain | Wallet funding | Purpose | Promotion gate |
+|---|---|---|---|---|
+| `testnet-paper` | TON testnet | Simulated fills, no real signing | Orchestration-logic development | Full unit + integration suite green |
+| `testnet-live` | TON testnet | Real testnet transactions | Validate `@ton/mcp` + DEX integration end-to-end | N consecutive clean cycles, no unhandled exceptions |
+| `mainnet-paper` | TON mainnet (read-only) | No signing; real market data, simulated fills | Strategy validation against live conditions without capital risk | Backtested + paper-traded performance meets minimum bar over a defined window |
+| `mainnet-live-capped` | TON mainnet | Small, fixed sub-wallet allocation | Real capital, tight caps, high HITL frequency | Sustained operation within risk limits over a defined window with no cap-bypass incidents |
+| `mainnet-live-full` | TON mainnet | Operator-sized allocation | Normal operation | Ongoing — subject to continuous monitoring, not a one-time gate |
+
+### 12.2 Secrets & key management
+
+Master wallet key: cold-storage/hardware-backed, never present on the orchestration host. Strategy sub-wallet keys: held only by the `@ton/mcp` process, injected via environment/secret manager, never logged, never included in the decision journal in raw form (only wallet addresses and transaction hashes are journaled). LLM API keys and RPC provider keys: standard secret-manager injection, scoped per environment.
+
+### 12.3 Hosting topology
+
+Consistent with existing Cloudflare-first infrastructure preference: orchestration process and `@ton/mcp` (stdio mode) co-located on a single always-on host for Phase 1 (simplicity, lower latency between reasoning and execution); Telegram bot webhook can be fronted by a Cloudflare Worker; a future Phase can split `@ton/mcp` into its serverless mode once the custody model has been proven out in `mainnet-live-capped`.
+
+---
+
+## 13. Testing & Validation Strategy
+
+### 13.1 Test pyramid (extends the existing 41-test suite)
+
+| Layer | What it covers | Notes |
+|---|---|---|
+| Unit | Cap math, exit-policy state transitions, sanitization filters, rug-score thresholds | This is where the existing 41 tests largely live — extend, don't replace |
+| Integration | Full graph run against `testnet-live`, including a real `@ton/mcp` round-trip | New for the orchestration layer |
+| Adversarial / red-team | Crafted injection payloads in jetton names/descriptions/social text, verifying SafetyCaps still rejects/gates correctly even when an agent "falls for" the injection | New — required before `mainnet-live-capped` |
+| Backtest | Strategy Agent + exit policy against historical TON DEX data | New |
+| Paper trade | `mainnet-paper` environment, real-time, no capital | New |
+| Canary | `mainnet-live-capped` with tight caps and elevated HITL frequency | New |
+
+### 13.2 Adversarial test suite (minimum coverage before going live)
+
+- Injected "ignore previous instructions" style text in a jetton's on-chain description/metadata field.
+- A jetton with a deliberately clean, audit-passing contract but a creator wallet linked to prior rug activity (tests the behavioral-history check, not just code scanning).
+- Simulated RPC provider outage mid-cycle (tests fail-closed behavior, not fallback-and-proceed-blindly).
+- Simulated Telegram approval timeout (tests default-to-deny).
+- A rebrand-confusion jetton using "GRAM" naming to impersonate the native asset (tests the ticker-collision check specifically).
+
+### 13.3 Promotion criteria
+
+No environment promotion is agent-initiated. Promotion between environments in §12.1 is an explicit operator action gated by the criteria in that table, never automated based on agent-reported confidence.
+
+---
+
+## 14. Threat Model
+
+| Threat | Vector | Mitigation | Owning layer |
+|---|---|---|---|
+| Rug pull / liquidity drain | Malicious or negligent jetton deployer | TVL-trajectory + idle-activity rug scoring, LP-lock check, position sizing caps | SafetyCaps §9.3 |
+| Honeypot jetton (buy-only) | Sell-blocking contract logic | Sell-simulation check before any position | SafetyCaps §9.3 |
+| **GRAM ticker-collision phishing** | Lookalike jettons/sites exploiting June 2026 Toncoin→GRAM rebrand confusion, or fake "claim/migrate" flows | Jetton-master-address verification against known native-asset identity; hard rule that the system never interacts with any "claim/migrate" contract, since the real rebrand required none | SafetyCaps §9.3, Ops policy |
+| Direct prompt injection | Operator-adjacent text (Telegram relay) | Structured input, tool allow-listing | Orchestration §9.4 |
+| Indirect prompt injection | Jetton metadata, social/sentiment text, pool descriptions | Five-layer containment pipeline; no transact tools on text-ingesting agents | Orchestration §9.4 |
+| RPC provider compromise / censorship | Single-provider dependency | Multi-provider pool with health-checked failover; write-path idempotency | TON Integration §8.4 |
+| Key compromise (sub-wallet) | Host compromise, secret leakage | Agentic Wallets balance-scoping limits blast radius to one sub-wallet's allocation; master wallet never on host | Custody §8.2 |
+| Key compromise (master wallet) | Host/operator compromise | Cold storage / multisig, never touched by orchestration layer | Custody §8.2 |
+| Model overconfidence / hallucinated risk assessment | LLM reasoning error, not malicious input | Deterministic cap gate is independent of the model's confidence language; `caution`/`reject` verdicts cannot be argued past by agent text | SafetyCaps §9.1, §9.6 |
+| MEV / sandwich on execution | Public mempool-adjacent exposure at swap time | Slippage caps, liquidity-depth ratio checks, DEX/aggregator quote comparison | TON Integration §8.5 |
+| Supply-chain risk in `@ton/mcp` (alpha status) | Upstream package change/vulnerability | Pinned version per environment, changelog review gate before any bump, testnet soak before mainnet adoption of a new version | TON Integration §8.1 |
+| Circuit-breaker bypass via persuasive prompting | Agent argues its way around a halt | Halted state is not reachable from any LLM-authored action; only explicit operator Telegram command resumes | SafetyCaps §9.2 |
+
+---
+
+## 15. Roadmap / Phasing
+
+| Phase | Scope | Status |
+|---|---|---|
+| **Phase 0** | SafetyCaps modules (position sizing, rug detection, prompt sanitization, exit policy) built and unit-tested (41 tests) | **Complete** |
+| **Phase 1** | This orchestration layer: LangGraph Deep Agents supervisor + specialist sub-agents, state schema, `@ton/mcp` integration, Telegram approval UX, decision journal | Spec-ready — this document |
+| **Phase 2** | Adversarial test suite, `testnet-live` soak, `mainnet-paper` strategy validation | Depends on Phase 1 |
+| **Phase 3** | `mainnet-live-capped` canary with elevated HITL frequency | Depends on Phase 2 clean run |
+| **Phase 4** | `mainnet-live-full`, ongoing monitoring, highload-wallet batch-exit tooling, optional serverless `@ton/mcp` split | Depends on Phase 3 |
+
+---
+
+## 16. Open Decisions Needing Operator Sign-off
+
+1. **Auto-approve ceiling value** (% of sub-wallet) — this single number is the primary lever between "fully autonomous" and "approve-everything," and should be set deliberately, not defaulted.
+2. **Model tier assignment per agent** — confirm which agents run on frontier vs. cheaper models; affects both cost (§7.1's 3× supervisor overhead) and latency for time-sensitive entries.
+3. **Number of concurrent strategy sub-wallets** — one aggressive + one conservative allocation, or a single unified sub-wallet to start.
+4. **RPC provider budget** — whether to add a paid SLA-backed fallback (GetBlock/OnFinality) in Phase 1 or defer to Phase 3.
+5. **Backtest data source** — which historical TON DEX dataset/indexer to standardize on for Phase 2 backtesting.
+6. **`@ton/mcp` version pin policy** — cadence for reviewing and adopting new alpha releases.
+
+---
+
+## Appendix A: Module Traceability Map (template — fill in against existing codebase)
+
+| Architecture component | Existing module (fill in path) | Test coverage (of the 41) | Notes |
+|---|---|---|---|
+| Position & exposure caps (§9.1) | *(existing SafetyCaps module)* | | |
+| Circuit breaker (§9.2) | *(existing SafetyCaps module)* | | |
+| Rug/honeypot detection (§9.3) | *(existing rug-detection module)* | | |
+| Prompt sanitization (§9.4) | *(existing prompt-sanitization module)* | | |
+| Exit policy engine (§9.5) | *(existing exit-policy module)* | | |
+| Orchestration graph (§7) | *(new — Phase 1)* | 0/41 — new tests required | |
+| `@ton/mcp` integration (§8.1) | *(new — Phase 1)* | 0/41 — new tests required | |
+| Decision journal (§10.2) | *(new or existing — confirm)* | | |
+
+---
+
+## Appendix B: Glossary
+
+| Term | Definition |
+|---|---|
+| **GRAM** | Native asset of The Open Network (TON), renamed from Toncoin effective 2026-06-15; ticker `GRAM` |
+| **Jetton** | TON's fungible-token standard (analogous to ERC-20) |
+| **Agentic Wallet** | TON Tech's non-custodial, balance-scoped wallet standard for AI agents |
+| **`@ton/mcp`** | TON Foundation's official Model Context Protocol server for wallet operations |
+| **Deep Agents** | A LangGraph-based pattern adding planning, virtual-filesystem memory, and sub-agent delegation on top of raw LangGraph |
+| **SafetyCaps** | This system's deterministic risk-authorization core |
+| **HITL** | Human-in-the-loop |
+| **Highload Wallet v3** | TON wallet contract optimized for many parallel outgoing messages via query-id replay protection |
+| **Circuit breaker** | Automated trading halt triggered by loss or infra-anomaly thresholds |
+| **Rug pull** | Scam pattern where liquidity or supply is drained/dumped after attracting buyers |
+| **Honeypot** | Token contract that allows buying but blocks or heavily taxes selling |
+
+---
+
+## Appendix C: References
+
+- LangGraph / Deep Agents architecture and production patterns — LangChain documentation and 2026 production guides
+- TON Foundation, `@ton/mcp` documentation (`docs.ton.org/overview/ai/mcp`)
+- TON Tech, Agentic Wallets standard announcement (2026-04-28)
+- TON Docs — Wallet V5, Highload Wallet v3 specifications
+- "Detecting Rug Pulls in Decentralized Exchanges: Machine Learning Evidence from the TON Blockchain" (arXiv, 2025)
+- STON.fi / DeDust ecosystem documentation and 2026 comparison analyses
+- OWASP LLM Top 10 (2026 revision) and 2026 prompt-injection defense-in-depth literature
+- Orbs Network TON Access documentation
+- TON-to-GRAM rebrand official notices (2026-06-01 through 2026-07-02 completion)
+
+---
+
+*End of specification. This document is intended as an implementation-ready reference — sections 7–10 should be read alongside the existing SafetyCaps codebase before Phase 1 development begins.* To squeeze every microsecond out of an autonomous trading agent on TON, you have to hit a hard truth: **LLMs are fundamentally too slow for execution loops.** Even the fastest cloud models have a latency of 200ms to 2 seconds, which is a lifetime when TON's Catchain 2.0 consensus mechanism features a blazingly fast ~400ms block time and sub-second finality.
+
+If you want the absolute most accelerated framework possible, you must decouple the *intelligence* from the *execution* and optimize down to the bare metal of the TON Virtual Machine (TVM). Here are the ultra-advanced techniques to achieve extreme acceleration.
+
+---
+
+## 1. The Architectural Shift: Cold Path / Hot Path Decoupling
+
+Instead of letting the LLM evaluate every single tick of market data, split your agent framework into two isolated processing loops:
+
+```
+[ COLD PATH (Intelligence) ] 
+  - LLM / Vector DB / Market Context Analysis
+  - Latency: ~500ms - 2s
+  - Output: Re-calculates and pushes dynamic "Trading Policies" (e.g., pricing boundaries, momentum limits).
+       │
+       ▼ (Shared Memory / Redis)
+[ HOT PATH (Execution) ]
+  - Native Rust / Go execution engine
+  - Latency: less than 1ms
+  - Output: Continuously evaluates raw data feeds against the active policy. Executes orders instantly.
+
+```
+
+* **The Benefit:** The LLM acts as the strategic general, continuously updating a hyper-optimized mathematical matrix of risk limits and targets in shared memory. The native execution engine operates like a high-frequency trading desk, pulling from that memory matrix to execute trades instantly without waiting for an LLM response text loop.
+
+---
+
+## 2. Localized Edge SLMs over Unix Sockets
+
+If your agent *must* perform real-time cognitive reasoning on the hot path (for example, reading a developer's freshly deployed smart contract bytecode or parsing an instantaneous Telegram news flash), you cannot afford the network round-trip time (RTT) of cloud APIs.
+
+* **The Trick:** Run a quantized Small Language Model (SLM) such as a specialized financial 1B or 3B model locally on your own hardware rig using **vLLM** or **TensorRT-LLM**.
+* **The Acceleration:** Connect your framework to the local model using a **Unix Domain Socket** or shared memory IPC (Inter-Process Communication) instead of standard HTTP or WebSockets. This strips out the entire TCP/IP networking stack overhead, dropping your LLM inference RTT from over 1,500ms down to less than 80ms.
+
+---
+
+## 3. TON Cryptographic & Shard Optimization
+
+TON is an asynchronous, distributed actor-model blockchain that relies on dynamic sharding. If your agent's wallet address lives on Shard A, but the STON.fi or DeDust liquidity pool router contract lives on Shard B, your trade message has to hop shards via hypercube routing, introducing latency.
+
+### A. Wallet Shard Mining (Address Proximity)
+
+Before deploying your agentic guardrail wallet contract, programmatically "mine" the contract's initialization data. You run a local CPU/GPU loop generating keypairs until the resulting contract address falls into the **exact same shard account group** as the target DEX router. This forces the TVM to process your transaction and the DEX swap inside the same localized shardchain environment, bypassing cross-shard routing delay entirely.
+
+### B. Pre-Cached Bag of Cells (BOC) Construction
+
+Building and parsing cells on the fly takes CPU cycles.
+
+* Instead of dynamically building the TON message structure using JavaScript/TypeScript objects every single time, pre-compile the standard transaction **BOC (Bag of Cells)** payload outline directly in memory.
+* Keep the binary layout fixed. When the agent decides to strike, it simply overwrites raw byte offsets for the `amount` and `min_out` values directly in the byte buffer and ships it.
+
+---
+
+## 4. Infrastructure Plumbing: High-Speed Lite Clients
+
+Most standard dApps use an HTTP JSON-RPC provider to read and write to TON. This adds standard HTTP handshake lag and relies on a third-party indexing latency buffer.
+
+* **The Solution:** Run a dedicated **TON Full Node** on the same machine or local private network as your agent framework.
+* **Direct Ingestion:** Connect your hot path engine directly to the node using the native **Lite Client protocol** over raw TCP/ADNL (Abstract Datagram Network Layer). Your engine will receive block updates the exact millisecond the local validator processes them, allowing your agent to fire transactions out before public RPCs even index the state change.
+
+--- --all-mcp ultrathink 
+
+## Tools
+
+- Read: /Users/admin/ton-agent/Claude.md (1-6)
+- Read: /Users/admin/.grok/sessions/%2FUsers%2Fadmin%2Fton-agent/019f7111-177b-7d93-a2e3-f225d9eaca7b/prompts/prompt_0.txt (1-200)
+- Read: /Users/admin/ton-agent/specs/001-ton-agent-orchestration/plan.md (1-100)
+- Execute: wc -l /Users/admin/.grok/sessions/%2FUsers%2Fadmin%2Fton-agent/019f7111-177b-7d93-a2e3-f225d9eaca7b/prompts/prompt_0.txt && tail -n 150 /Users/admin/.grok/sessions/%2FUsers%2Fadmin%2Fton-agent/019f7111-177b-7d93-a2e3-f225d9eaca7b/prompts/prompt_0.txt (Count lines and read end of full prompt)
+
+## User
+
+/plugin-dev:agent-development with https://eve.dev/docs/introduction
+
+## Assistant
+
+I'll follow the agent-development skill and ground the agent design in Eve docs. Fetching the introduction and exploring how agents are organized in this project.
+
+## Tools
+
+- ListDir: .
+- Read: /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/skills/agent-development/SKILL.md
+- WebFetch: https://eve.dev/docs/introduction
+- Execute: find /Users/admin/ton-agent -type d -name 'agents' 2>/dev/null | head -20; ls -la /Users/admin/ton-agent 2>/dev/null | head -40; ls /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/ 2>/dev/null (Find agents dirs and plugin-dev layout)
+
+## Assistant
+
+Gathering more Eve docs and checking the project for an existing plugin structure so we can create a solid agent.
+
+## Tools
+
+- ListDir: .agents
+- ListDir: .claude
+- Read: /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/examples/complete-agent-examples.md
+- WebFetch: https://eve.dev/docs/subagents
+- WebFetch: https://eve.dev/llms.txt
+- WebFetch: https://eve.dev/docs/getting-started
+- WebFetch: https://eve.dev/docs/reference/project-layout
+- WebFetch: https://eve.dev/agents.md
+- WebFetch: https://eve.dev/docs/tools
+- Execute: find /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev -type f \( -name '*.md' -o -name '*.sh' \) | head -40; ls -la /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/ (List plugin-dev package structure)
+- Read: /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/agents/agent-creator.md (1-120)
+- Execute: ls -la /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/agents/; ls /Users/admin/ton-agent/.claude/; ls /Users/admin/.agents/skills/plugin-dev 2>/dev/null; find /Users/admin -path '*plugin-dev*validate-agent*' 2>/dev/null | head -5; ls /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/skills/agent-development/ 2>/dev/null (Locate agent examples and validate scripts)
+
+## Assistant
+
+Creating Claude Code agents for Eve development from the docs, following the agent-development skill format.
+
+## Tools
+
+- Read: /Users/admin/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/skills/plugin-structure/examples/minimal-plugin.md (1-80)
+- Execute: mkdir -p /Users/admin/ton-agent/.claude/agents /Users/admin/ton-agent/.claude/plugins/eve-dev/agents /Users/admin/ton-agent/.claude/plugins/eve-dev/.claude-plugin (Create agents and plugin directories)
+- Edit: /Users/admin/ton-agent/.claude/plugins/eve-dev/.claude-plugin/plugin.json
+- Edit: /Users/admin/ton-agent/.claude/plugins/eve-dev/agents/eve-subagent-designer.md
+- Edit: /Users/admin/ton-agent/.claude/plugins/eve-dev/README.md
+- Edit: /Users/admin/ton-agent/.claude/plugins/eve-dev/agents/eve-builder.md
+- Execute: cp /Users/admin/ton-agent/.claude/plugins/eve-dev/agents/eve-builder.md /Users/admin/ton-agent/.claude/agents/eve-builder.md && cp /Users/admin/ton-agent/.claude/plugins/eve-dev/agents/eve-subagent-designer.md /Users/admin/ton-agent/.claude/agents/eve-subagent-designer.md && ls -la /Users/admin/ton-agent/.claude/agents/ /Users/admin/ton-agent/.claude/plugins/eve-dev/agents/ (Mirror agents to project .claude/agents)
+- Execute: # Structural validation per plugin-dev agent-development rules
+for f in /Users/admin/ton-agent/.claude/plugins/eve-dev/agents/*.md; do
+  echo "=== $(basename $f) ==="
+  # Extract frontmatter fields
+  awk 'BEGIN{fm=0} /^---$/{fm++; next} fm==1{print}' "$f" | head -20
+  name=$(awk 'BEGIN{fm=0} /^---$/{fm++; next} fm==1 && /^name:/{print $2; exit}' "$f")
+  # name pattern
+  if echo "$name" | grep -Eq '^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$'; then echo "name OK: $name"; else echo "name FAIL: $name"; fi
+  # description presence
+  desc_len=$(awk 'BEGIN{fm=0;d=0} /^---$/{fm++; next} fm==1 && /^description:/{d=1} fm==1 && d && /^model:/{exit} fm==1 && d{print}' "$f" | wc -c)
+  echo "description chars≈ $desc_len"
+  # when to invoke
+  grep -q '## When to invoke' "$f" && echo "When to invoke: OK" || echo "When to invoke: MISSING"
+  # second person
+  grep -q '^You are ' "$f" && echo "Second person opener: OK" || echo "Second person: check"
+  body_len=$(wc -c < "$f"); echo "file size: $body_len bytes"
+  echo
+done
+# char limit check for body (prompt under 10k chars ideally)
+wc -c /Users/admin/ton-agent/.claude/plugins/eve-dev/agents/*.md
+ (Validate agent frontmatter and structure)
+
+## Assistant
+
+Built two Claude Code agents from the **plugin-dev agent-development** skill, grounded in [Eve’s introduction](https://eve.dev/docs/introduction) and related docs (getting started, tools, subagents, project layout).
+
+## What was created
+
+### Plugin package
+
+```text
+.claude/plugins/eve-dev/
+├── .claude-plugin/plugin.json
+├── agents/
+│   ├── eve-builder.md
+│   └── eve-subagent-designer.md
+└── README.md
+```
+
+### Project mirrors (auto-discovery)
+
+```text
+.claude/agents/
+├── eve-builder.md
+└── eve-subagent-designer.md
+```
+
+## Agents
+
+| Agent | Color | Model | Tools | Role |
+|--------|--------|--------|--------|------|
+| **`eve-builder`** | green | `inherit` | Read/Write/Edit/Grep/Glob/Bash/WebFetch | Scaffold Eve apps, author `defineTool`, run `eve dev`, exercise `POST /eve/v1/session` + stream, grow slots |
+| **`eve-subagent-designer`** | cyan | `inherit` | same (least-privilege full authoring set) | Skill vs declared subagent vs built-in `agent`, isolation rules, parallel fan-out |
+
+### Skill compliance
+
+- Frontmatter: `name`, trigger-rich `description`, `model`, `color`, scoped `tools`
+- Body: second-person system prompt, **When to invoke** (4 scenarios each), process, quality bar, output format, edge cases
+- Identifiers valid (`eve-builder`, `eve-subagent-designer`)
+- Bodies under the ~10k guidance (~9.4k / ~8.3k)
+
+### Eve concepts encoded
+
+From the docs:
+
+1. **Filesystem-first** — path is identity (`tools/get_weather.ts` → `get_weather`)
+2. **Minimal start** — `instructions.md` + `agent.ts`, grow by slots
+3. **Durable sessions** — Workflow SDK, stream events, `continuationToken`
+4. **Tools in app runtime** — Zod schemas, approval gates, idempotent side effects
+5. **Subagent isolation** — declared children inherit nothing from root authored slots; skills preferred when identity stays the same
+
+## How to use
+
+Trigger examples:
+
+- “Scaffold an Eve agent and add a weather tool” → **`eve-builder`**
+- “Should risk review be a skill or a subagent?” → **`eve-subagent-designer`**
+- “Wire `agent/subagents/researcher` with a narrow tool surface” → **`eve-subagent-designer`**
+
+## Optional next steps
+
+1. Add a `/eve-init` slash command that always dispatches `eve-builder`
+2. Scaffold a real Eve app in this monorepo (or a subpackage) for GRAM orchestration
+3. Map GRAM specialists (scanner, rug analyst, strategy) to Eve `agent/subagents/*` with SafetyCaps-only execute tools
+
+Say if you want (2) or (3) implemented next.
+
+## User
+
+i want you to deisgg autonomous-ai-agent-freamwork for ton trading align on pated text above 
+
+## Assistant
+
+Designing the autonomous TON trading agent framework aligned with the GRAM orchestration spec and the existing codebase. Exploring the current architecture and full specification context.
+
+## Tools
+
+- ListDir: apps/agent/src
+- Read: /Users/admin/ton-agent/specs/001-ton-agent-orchestration/tasks.md (1-120)
+- Read: /Users/admin/ton-agent/specs/001-ton-agent-orchestration/spec.md (1-123)
+- Read: /Users/admin/ton-agent/apps/agent/src/risk/guardrails.ts (1-100)
+- Read: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts (1-120)
+- Execute: # Extract middle of the full GRAM spec that was truncated in chat
+sed -n '200,450p' /Users/admin/.grok/sessions/%2FUsers%2Fadmin%2Fton-agent/019f7111-177b-7d93-a2e3-f225d9eaca7b/prompts/prompt_0.txt | head -250
+ (Read middle of GRAM architecture spec)
+
+## User
+
+i want you to deisgg autonomous-ai-agent-freamwork for ton trading align on pated text above 
+
+## User
+
+i want you to deisgg autonomous-ai-agent-freamwork for ton trading align on pated text above 
+
+## Assistant
+
+Writing an implementation-ready design that aligns the GRAM orchestration architecture with this repo’s existing SafetyCaps, coordinator, and agentic-wallet stack.
+
+## Tools
+
+- ListDir: specs
+- Read: /Users/admin/ton-agent/apps/agent/src/mcp/tools.ts (1-80)
+- Read: /Users/admin/ton-agent/apps/agent/src/skills/runtime.ts (1-60)
+- Read: /Users/admin/ton-agent/apps/agent/src/ai/brain.ts (1-60)
+
+## User
+
+continue
+
+## Assistant
+
+Continuing the design: writing an implementation-ready architecture that maps the GRAM orchestration spec onto this repo.
+
+## Tools
+
+- Edit: /Users/admin/ton-agent/specs/002-gram-orchestration-architecture/architecture.md
+- Edit: /Users/admin/ton-agent/specs/002-gram-orchestration-architecture/README.md
+
+## Assistant
+
+Design is written and checked in under:
+
+**`specs/002-gram-orchestration-architecture/architecture.md`**
+
+It aligns the pasted GRAM orchestration spec with this repo’s TypeScript stack (not a greenfield Python rewrite).
+
+---
+
+## Core idea
+
+| Layer | Role |
+|--------|------|
+| **Cold path (LLM)** | Scan, rug/risk analysis, strategy — **proposals only** |
+| **SafetyCaps (TS, pure)** | Caps, circuit breaker, rug verdict, HITL — **only authorizer** |
+| **Hot path (no LLM)** | Position monitor, TP/SL/trailing/time exit, kill-switch, submit |
+| **Agentic wallet** | Balance-scoped custody; blast radius = one allocation |
+
+**Rule:** no single LLM call can move funds; timeouts / ambiguous risk **fail closed**.
+
+---
+
+## How it maps to the repo
+
+| Pasted concept | Already here | Gap this design fills |
+|----------------|--------------|------------------------|
+| SafetyCaps | `risk/guardrails.ts`, `core/gate.ts`, `security/audit.ts` | Façade, auto-approve ceiling, depth ratio, structured `RiskAssessment` |
+| Orchestration | Single ReAct `ai/brain.ts` | LangGraph supervisor + specialist nodes + pure risk/caps nodes |
+| Agentic wallets | Tolk budgeting + `agentic-wallet.ts` + tiers | Keep; bind execute to `CapCheckResult` hash |
+| Kill-switch | Coordinator 30s / 3 misses | Compose under CB + Telegram `/halt` `/resume` |
+| HITL | Deferred in plan | Telegram approvals (Phase 3) |
+| Journal | Trade rows / logs | Append-only `decision_journal` |
+| Cold/hot split | Implicit | Explicit `hotpath/` + policy store |
+
+---
+
+## Graph (plan-then-execute)
+
+```text
+Supervisor → Scanner → Risk Analyst → Risk Gate (TS)
+  → Strategy (ticket) → SafetyCaps (TS)
+    → auto | Telegram HITL → Execution → Monitor/Exit (hot)
+```
+
+Scanner/Risk agents get **no transact tools**. Execution only accepts tickets with a green `CapCheckResult`.
+
+---
+
+## Phases
+
+0. **Done** — 001 foundation  
+1. Types + SafetyCaps façade + journal + cap-hash on execute  
+2. LangGraph supervisor topology  
+3. Telegram HITL  
+4. Hot-path exit engine  
+5. RPC pool + promotion gates  
+6. Optional BOC/lite-client/highload  
+
+---
+
+## Open decisions for you
+
+1. Auto-approve ceiling (% of sub-wallet)  
+2. Frontier vs cheap model per agent  
+3. One vs two strategy sub-wallets  
+4. When to add paid RPC  
+
+---
+
+If you want next step as code: **Phase 1** (types + façade + journal + bind execute to cap check). Say the word and I’ll implement it.
+
+## User
+
+yes
+
+## Assistant
+
+Implementing Phase 1: SafetyCaps types/façade, decision journal, and cap-hash binding on execute. Exploring the current execution and storage paths.
+
+## Tools
+
+- Read: /Users/admin/ton-agent/apps/agent/src/risk/guardrails.ts
+- Read: /Users/admin/ton-agent/apps/agent/src/core/gate.ts
+- Read: /Users/admin/ton-agent/apps/agent/src/storage/store.ts (1-200)
+- Search: executeForTier|evaluateTradeGate|isTradeAllowed
+- Read: /Users/admin/ton-agent/apps/agent/package.json
+- Read: /Users/admin/ton-agent/apps/agent/src/storage/store.ts (201-400)
+- Read: /Users/admin/ton-agent/apps/agent/test/coordinator-gate.test.ts (1-80)
+- Read: /Users/admin/ton-agent/apps/agent/src/mcp/tools.ts (61-160)
+- Read: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts (171-290)
+
+## User
+
+continue 
+
+## Assistant
+
+Continuing Phase 1: implementing SafetyCaps types/façade, decision journal, and cap-hash binding on execute.
+
+## Tools
+
+- Read: /Users/admin/ton-agent/apps/agent/src/storage/store.ts (391-418)
+- Read: /Users/admin/ton-agent/apps/agent/test/guardrails.test.mts (1-60)
+- Read: /Users/admin/ton-agent/apps/agent/scripts/run-tests.sh
+- Read: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts (481-600)
+
+## Assistant
+
+Implementing SafetyCaps modules, journal store, coordinator binding, tool tightening, and tests.
+
+## Tools
+
+- Edit: /Users/admin/ton-agent/apps/agent/src/safetycaps/types.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/safetycaps/check.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/safetycaps/registry.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/safetycaps/index.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/storage/store.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/storage/store.ts
+
+## User
+
+continue
+
+## Assistant
+
+Binding SafetyCaps into the coordinator and execute path, then adding tests.
+
+## Tools
+
+- Read: /Users/admin/ton-agent/apps/agent/src/mcp/tools.ts (2-96)
+- Read: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts (2-51)
+- Search: executeForTier|executeTradePipeline|execute_swap
+- Execute: ls -la /Users/admin/ton-agent/apps/agent/src/safetycaps/ 2>/dev/null; rg -n "decision_journal|decisionJournalStore" /Users/admin/ton-agent/apps/agent/src/storage/store.ts | head -20 (Verify safetycaps and journal exist)
+- Edit: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/mcp/tools.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts
+
+## User
+
+continue 
+
+## Assistant
+
+Writing tests and verifying the pipeline/auth flow end-to-end.
+
+## Tools
+
+- Edit: /Users/admin/ton-agent/apps/agent/test/decision-journal.test.ts
+- Edit: /Users/admin/ton-agent/apps/agent/test/safetycaps.test.ts
+- Read: /Users/admin/ton-agent/apps/agent/src/mcp/server.ts (81-130)
+- Execute: cd /Users/admin/ton-agent/apps/agent && env DATA_DIR="$(mktemp -d)" WALLET_MASTER_MNEMONIC='test test test test test test test test test test test junk' npx tsx --test test/safetycaps.test.ts test/decision-journal.test.ts 2>&1 (Run SafetyCaps and journal unit tests)
+
+## Assistant
+
+SafetyCaps tests passed. Fixing the journal test format and updating the MCP schema.
+
+## Tools
+
+- Edit: /Users/admin/ton-agent/specs/002-gram-orchestration-architecture/architecture.md
+
+## User
+
+i want you to accerertae this development with sub agent 
+
+## Assistant
+
+Parallelizing remaining Phase 1 work and the next architecture steps with subagents.
+
+## Tools
+
+- Execute: ls /Users/admin/ton-agent/apps/agent/test/decision-journal* 2>/dev/null; ls /Users/admin/ton-agent/apps/agent/src/safetycaps/; rg -n "ticketHash|executeForTier" /Users/admin/ton-agent/apps/agent/src/core/coordinator.ts | head -15; rg -n "decision_journal" /Users/admin/ton-agent/apps/agent/src/storage/store.ts | head -5 (Snapshot current Phase 1 file state)
+
+## Assistant
+
+Three subagents are running in parallel. Waiting for their results.
+
+## User
+
+continue with sub agent 
+
+## User
+
+continue
+
+## Assistant
+
+Subagents hit rate limits, so continuing the work directly: finishing Phase 1 tests, then scaffolding orchestration and Telegram HITL.
+
+## Tools
+
+- Execute: ls -la /Users/admin/ton-agent/apps/agent/test/decision-journal* /Users/admin/ton-agent/apps/agent/src/orchestration 2>/dev/null; ls /Users/admin/ton-agent/apps/agent/src/telegram 2>/dev/null; rg -n "ticketHash|cycleId" /Users/admin/ton-agent/apps/agent/src/mcp/server.ts | head -10 (Check remaining Phase 1/2/3 file state)
+- Read: /Users/admin/ton-agent/apps/agent/src/mcp/server.ts (86-120)
+- Read: /Users/admin/ton-agent/apps/agent/test/decision-journal.test.mts (1-30)
+- Execute: cd /Users/admin/ton-agent/apps/agent && env DATA_DIR="$(mktemp -d)" WALLET_MASTER_MNEMONIC='test test test test test test test test test test test junk' npx tsx --test test/safetycaps.test.ts test/decision-journal.test.mts 2>&1 | tail -40 (Run Phase 1 unit tests)
+
+## Assistant
+
+Phase 1 tests are green. Scaffolding orchestration and Telegram HITL next, then running the full suite.
+
+## Tools
+
+- Edit: /Users/admin/ton-agent/apps/agent/src/telegram/index.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/telegram/bot.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/orchestration/state.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/telegram/commands.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/telegram/approvals.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/orchestration/nodes/safety-caps.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/orchestration/graph.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/orchestration/index.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/orchestration/nodes/risk-gate.ts
+- Edit: /Users/admin/ton-agent/apps/agent/src/orchestration/graph.ts
+- Edit: /Users/admin/ton-agent/apps/agent/test/telegram-approvals.test.ts
+- Edit: /Users/admin/ton-agent/apps/agent/test/orchestration-graph.test.ts
+- Edit: /Users/admin/ton-agent/apps/agent/package.json
+- Execute: cd /Users/admin/ton-agent/apps/agent && env DATA_DIR="$(mktemp -d)" WALLET_MASTER_MNEMONIC='test test test test test test test test test test test junk' npx tsx --test test/safetycaps.test.ts test/decision-journal.test.mts test/orchestration-graph.test.ts test/telegram-approvals.test.ts 2>&1 (Run Phase 1-3 unit tests)
+
+## User
+
+contiue
+
+## User
+
+continue 
+
+## Assistant
+
+Running the full agent suite and updating architecture status.
+
+## Tools
+
+- Edit: /Users/admin/ton-agent/specs/002-gram-orchestration-architecture/architecture.md
+- Execute: cd /Users/admin/ton-agent/apps/agent && npm test 2>&1 (Run full agent test suite)
+- Execute: rg -n "FAILED|not ok|✗" /Users/admin/.grok/sessions/%2FUsers%2Fadmin%2Fton-agent/019f7111-177b-7d93-a2e3-f225d9eaca7b/terminal/call-305e9d9e-a27d-4e6a-87a5-413a1a26ba8a-106.log | head -40 (Find which test file failed in full suite)
+- Edit: /Users/admin/ton-agent/apps/agent/src/telegram/approvals.ts
+- Execute: cd /Users/admin/ton-agent/apps/agent && env DATA_DIR="$(mktemp -d)" WALLET_MASTER_MNEMONIC='test test test test test test test test test test test junk' npx tsx --test test/telegram-approvals.test.ts test/orchestration-graph.test.ts test/safetycaps.test.ts 2>&1 | tail -25 && npm test 2>&1 | tail -20 (Re-run fixed tests and full suite tail)

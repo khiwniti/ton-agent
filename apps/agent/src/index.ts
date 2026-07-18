@@ -15,7 +15,10 @@ import { makeClient, openWallet, loadKeyPair } from "./wallet/wallet";
 import { getCoordinator, startCoordinator, isCoordinatorStarted } from "./core/coordinator";
 import { postEnvelope } from "./webhook";
 import { startRadar } from "./radar/scanner";
-import { runMonitor } from "./wallet/position-manager";
+// Phase 4: import from hotpath/ (new exit-policy-engine-based monitor).
+// When EXIT_ENGINE_ENABLED=false, hotpath/position-monitor delegates to
+// the legacy wallet/position-manager for backward compatibility.
+import { runMonitor } from "./hotpath/position-monitor";
 // Side-effect import — registers all skills so the brain prompt and the
 // `npm run skill` CLI see them.
 import "./skills";

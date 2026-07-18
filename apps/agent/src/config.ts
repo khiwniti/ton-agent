@@ -97,6 +97,12 @@ export const CONFIG = {
         apiHash: req("TELETON_API_HASH"),
         session: req("TELETON_SESSION"),
     },
+    // Phase 4 (spec 002 §8.5 / §17): when false, the hot-path
+    // position monitor delegates to the legacy wallet/position-manager
+    // ticker — so an unsuspecting operator sees zero behavioural change
+    // (FR-013 pattern). Flipping to true engages the pure
+    // exit/policy-engine.ts state machine + journal-first tick loop.
+    exitEngineEnabled: bool("EXIT_ENGINE_ENABLED", false),
 };
 
 export const isTestnet = () => CONFIG.network === "testnet";

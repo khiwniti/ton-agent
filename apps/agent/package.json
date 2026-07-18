@@ -15,11 +15,17 @@
     "mcp": "ts-node src/mcp/standalone.ts",
     "plan": "ts-node src/cli/agent-plan.ts",
     "status": "ts-node src/cli/status-cli.ts",
-    "test": "tsx --test test/*.test.ts test/*.test.mts",
+    "test": "bash scripts/run-tests.sh",
     "test:gate": "tsx --test test/coordinator-gate.test.ts",
     "test:guardrails": "tsx --test test/guardrails.test.mts",
+    "test:safetycaps": "tsx --test test/safetycaps.test.ts",
+    "test:orchestration": "tsx --test test/orchestration-graph.test.ts",
+    "test:telegram": "tsx --test test/telegram-approvals.test.ts",
     "test:skills": "tsx --test test/skills.test.ts",
-    "test:wallet-bootstrap": "env DATA_DIR=\"$(mktemp -d)\" WALLET_MASTER_MNEMONIC='test test test test test test test test test test test junk' tsx --test test/wallet-bootstrap.test.ts"
+    "test:wallet-bootstrap": "env DATA_DIR=\"$(mktemp -d)\" WALLET_MASTER_MNEMONIC='test test test test test test test test test test test junk' tsx --test test/wallet-bootstrap.test.ts",
+    "test:contracts": "tsx --test test/contract.test.ts test/budgeting-wallet.test.ts",
+    "build:contract": "acton build",
+    "compile:contract": "acton compile contracts/budgeting-wallet.tolk --boc build/contracts/budgeting-wallet.boc"
   },
   "dependencies": {
     "@dedust/sdk": "^0.8.7",

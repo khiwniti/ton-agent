@@ -1,0 +1,15 @@
+[package]
+name = "ton-agent-orchestration"
+version = "1.0.0"
+description = "TON Autonomous AI Agent Orchestration Framework — Budgeting Wallet Contract"
+
+[contracts.budgeting-wallet]
+display-name = "Budgeting Wallet"
+src = "contracts/budgeting-wallet.tolk"
+output = "budgeting-wallet.boc"
+
+[build]
+out-dir = "build/contracts"
+
+[test]
+include = ["apps/agent/test/**/*.test.tolk"]

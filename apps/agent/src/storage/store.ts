@@ -23,6 +23,30 @@ try {
   // Column already exists — safe to ignore.
 }
 
+// Phase 4: hot-path exit-policy state. Inline try/catch ALTER matches the
+// confidence_score pattern; safe on fresh DBs (columns absent→added) and
+// existing ones (present→no-op). No backfill needed: defaults are inert.
+//   max_hold_ms    — per-position time-limit; 0/NULL = no TimeExit (spec §8.5)
+//   exit_by_ms     — computed deadline = entry_at + max_hold_ms (denormalised for fast tick checks)
+//   rugged         — 1 once emergency-exit fired on audit `reject`; COALESCE-guarded so it never resets
+//   rugged_at      — detection timestamp
+//   emergency_exit — 1 once an emergency exit was executed for this position
+const PHASE4_COLUMNS: Array<[string, string]> = [
+  ["max_hold_ms", "INTEGER"],
+  ["exit_by_ms", "INTEGER"],
+  ["rugged", "INTEGER NOT NULL DEFAULT 0"],
+  ["rugged_at", "INTEGER"],
+  ["emergency_exit", "INTEGER NOT NULL DEFAULT 0"],
+];
+for (const [col, type] of PHASE4_COLUMNS) {
+  try {
+    db.exec(`ALTER TABLE positions ADD COLUMN ${col} ${type}`);
+    log.info("STORE", `migrated positions table — added ${col} column`);
+  } catch {
+    // Column already exists — safe to ignore.
+  }
+}
+
 // Initialize tables
 db.exec(`
   CREATE TABLE IF NOT EXISTS positions (
@@ -117,6 +141,24 @@ db.exec(`
     tx_hash TEXT UNIQUE,
     created_at INTEGER NOT NULL
   );
+
+  -- GRAM Phase 1: append-only decision journal (never UPDATE in place)
+  CREATE TABLE IF NOT EXISTS decision_journal (
+    id TEXT PRIMARY KEY,
+    cycle_id TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    agent TEXT NOT NULL,
+    model_used TEXT,
+    input_hash TEXT NOT NULL,
+    tool_calls TEXT,
+    output TEXT,
+    cap_check_result TEXT,
+    hitl_status TEXT,
+    final_action TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_decision_journal_cycle
+    ON decision_journal(cycle_id, ts);
 `);
 
 // Helper types matching shared schema
@@ -140,6 +182,12 @@ export interface DbPosition {
   take_profit_t1_tx?: string;
   close_tx?: string;
   close_at?: number;
+  // Phase 4 hot-path exit state (all optional/nullable for migration compat)
+  max_hold_ms?: number | null;       // 0/NULL = no TimeExit
+  exit_by_ms?: number | null;        // deadline = entry_at + max_hold_ms
+  rugged?: number;                    // 1 once emergency-exit fired (never reset)
+  rugged_at?: number | null;
+  emergency_exit?: number;            // 1 once an emergency exit was executed
 }
 
 // Positions API
@@ -167,7 +215,15 @@ export const positionsStore = {
         status=excluded.status,
         take_profit_t1_tx=COALESCE(excluded.take_profit_t1_tx, take_profit_t1_tx),
         close_tx=COALESCE(excluded.close_tx, close_tx),
-        close_at=COALESCE(excluded.close_at, close_at)
+        close_at=COALESCE(excluded.close_at, close_at),
+        -- Phase 4 exit state. max_hold_ms/exit_by_ms set on entry only; the
+        -- tick just updates price/pnl/status and at exit flips rugged flags.
+        -- COALESCE keeps rugged/rugged_at/emergency_exit sticky (once set, stays set).
+        max_hold_ms=COALESCE(excluded.max_hold_ms, max_hold_ms),
+        exit_by_ms=COALESCE(excluded.exit_by_ms, exit_by_ms),
+        rugged=COALESCE(excluded.rugged, rugged),
+        rugged_at=COALESCE(excluded.rugged_at, rugged_at),
+        emergency_exit=COALESCE(excluded.emergency_exit, emergency_exit)
     `);
     stmt.run(p);
   },
@@ -414,4 +470,102 @@ export const dailyPnlStore = {
       ON CONFLICT(day) DO UPDATE SET pnl_ton = pnl_ton + excluded.pnl_ton
     `).run(today, pnl);
   }
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// GRAM Phase 1: Append-only decision journal
+// Rule: if it is not journaled, it did not happen (for post-mortems).
+// ─────────────────────────────────────────────────────────────────────
+export interface DbJournalEntry {
+  id: string;
+  cycle_id: string;
+  ts: number;
+  agent: string;
+  model_used?: string | null;
+  input_hash: string;
+  tool_calls?: string | null;
+  output?: string | null;
+  cap_check_result?: string | null;
+  hitl_status?: string | null;
+  final_action: string;
+}
+
+export interface JournalAppendInput {
+  cycle_id: string;
+  agent: string;
+  final_action: string;
+  input_hash?: string;
+  model_used?: string;
+  tool_calls?: unknown;
+  output?: unknown;
+  cap_check_result?: unknown;
+  hitl_status?: string;
+  /** Optional stable id; auto-generated when omitted. */
+  id?: string;
+}
+
+function jsonOrNull(v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  if (typeof v === "string") return v;
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
+}
+
+export const decisionJournalStore = {
+  /**
+   * Append a journal row. Never updates existing rows.
+   * Returns the assigned id.
+   */
+  append(entry: JournalAppendInput): string {
+    const id =
+      entry.id ??
+      `jrn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+    const row: DbJournalEntry = {
+      id,
+      cycle_id: entry.cycle_id,
+      ts: Date.now(),
+      agent: entry.agent,
+      model_used: entry.model_used ?? null,
+      input_hash: entry.input_hash ?? "none",
+      tool_calls: jsonOrNull(entry.tool_calls),
+      output: jsonOrNull(entry.output),
+      cap_check_result: jsonOrNull(entry.cap_check_result),
+      hitl_status: entry.hitl_status ?? null,
+      final_action: entry.final_action,
+    };
+    db.prepare(`
+      INSERT INTO decision_journal (
+        id, cycle_id, ts, agent, model_used, input_hash,
+        tool_calls, output, cap_check_result, hitl_status, final_action
+      ) VALUES (
+        @id, @cycle_id, @ts, @agent, @model_used, @input_hash,
+        @tool_calls, @output, @cap_check_result, @hitl_status, @final_action
+      )
+    `).run(row);
+    return id;
+  },
+
+  listByCycle(cycleId: string): DbJournalEntry[] {
+    return db
+      .prepare(
+        "SELECT * FROM decision_journal WHERE cycle_id = ? ORDER BY ts ASC",
+      )
+      .all(cycleId) as DbJournalEntry[];
+  },
+
+  get(id: string): DbJournalEntry | undefined {
+    return db
+      .prepare("SELECT * FROM decision_journal WHERE id = ?")
+      .get(id) as DbJournalEntry | undefined;
+  },
+
+  count(): number {
+    const row = db
+      .prepare("SELECT COUNT(*) as c FROM decision_journal")
+      .get() as { c: number };
+    return row?.c ?? 0;
+  },
 };
