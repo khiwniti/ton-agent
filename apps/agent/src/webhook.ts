@@ -13,6 +13,7 @@
  * outer `id` AND placing it inside `payload.id`, dedupe works regardless of
  * which field the row mapper chooses to trust.
  */
+import { createHmac } from "node:crypto";
 import axios from "axios";
 import { CONFIG } from "./config";
 import { log } from "./logger";
@@ -41,23 +42,24 @@ export async function postEnvelope(opts: PostEnvelopeOpts): Promise<PostEnvelope
   }
   try {
     log.info("WEBHOOK", `POST kind=${opts.kind} tier=${opts.walletTier ?? '-'} id=${id}`);
-    await axios.post(
-      url,
-      {
-        id,
-        at: Date.now(),
-        kind: opts.kind,
-        walletTier: opts.walletTier,
-        payload: { ...opts.payload, id },
+    const body = {
+      id,
+      at: Date.now(),
+      kind: opts.kind,
+      walletTier: opts.walletTier,
+      payload: { ...opts.payload, id },
+    };
+    const bodyJson = JSON.stringify(body);
+    const signature = createHmac("sha256", CONFIG.agentSharedSecret)
+      .update(bodyJson)
+      .digest("hex");
+    await axios.post(url, bodyJson, {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Agent-Secret": signature,
       },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          "X-Agent-Secret": CONFIG.agentSharedSecret,
-        },
-        timeout: 10_000,
-      }
-    );
+      timeout: 10_000,
+    });
     log.ok("WEBHOOK", `OK kind=${opts.kind} id=${id}`);
     return { sent: true, id };
   } catch (e: any) {
