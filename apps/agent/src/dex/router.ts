@@ -90,6 +90,32 @@ export interface SwapRequest {
   budgetingAddress?: string;
 }
 
+import {
+  EXIT_RESERVE_TON,
+  evaluateBuyGasGuard,
+  evaluateSellGasGuard,
+} from "./swap-gas-guard";
+
+// ── Worst-case exit reserve ───────────────────────────────────────────
+//
+// Why we reserve TON for swaps even on the buy path:
+//   In a worst-case scenario (every open position rug-pulls / dumps),
+//   we MUST still be able to call exit (sell → TON). Ston.fi sells forward
+//   ~0.25 TON + ~0.05 gas; DeDust sells reserve 0.35 TON explicitly. A sell
+//   the wallet can't AFFORD will be dropped by the broadcaster at send-time,
+//   leaving the position stuck OPEN, and the SL/TP exit will keep firing
+//   forever against the same dead wallet. This floor guarantees that even
+//   when every position burns zero, there is enough TON left to:
+//     (a) pay gas for the next sell, and
+//     (b) keep the bank's exit door open until an operator tops up.
+//
+// NOTE: this is checked on BOTH sides:
+//   - BUY gate: refuse a buy when balance <  requested_size + exit_reserve.
+//   - SELL gate: refuse a sell when balance <  exit_reserve (covers the
+//                send + forward + gas fees for THIS sell).
+//
+// Implementation: see swap-gas-guard.ts (pure functions, unit-tested).
+
 /**
  * DeDust swap-payload builder — `VaultJetton.createSwapPayload` is the only
  * static builder exposed by the SDK in v0.8.x. It produces a TL-B cell that
@@ -122,9 +148,12 @@ async function stonfiBuy(
   tier: "low" | "mid" | "high"
 ): Promise<SwapResult> {
   const bal = await w.getBalance();
-  const reqd = BigInt(toNano((p.amountTon + 0.25).toString()));
-  if (bal < reqd) {
-    throw new Error(`insufficient balance have=${fromNano(bal)} need=${fromNano(reqd)}`);
+  // Refuses the buy when wallet can't afford position + forward + exit-reserve.
+  // See swap-gas-guard.ts — the worst-case sell must still be payable after
+  // this buy settles.
+  const guard = evaluateBuyGasGuard(Number(fromNano(bal)), p.amountTon);
+  if (!guard.ok) {
+    throw new Error(guard.error);
   }
 
   const router = client.open(
@@ -183,6 +212,17 @@ async function stonfiSell(
     throw new Error("jettonAmountNano is required for sell swap");
   }
 
+  // Worst-case exit-reserve preflight: refuse to broadcast when the wallet
+  // cannot pay sell gas (txParams.value≈0.25 forward + ≈0.05 sender gas).
+  // Returning here is cheaper than letting the broadcaster drop the tx and
+  // re-fire every monitor tick forever.
+  const bal = await w.getBalance();
+  const sellGuard = evaluateSellGasGuard(Number(fromNano(bal)));
+  if (!sellGuard.ok) {
+    log.err("STONFI", `[${tier.toUpperCase()}] sell REFUSED: ${sellGuard.error}`);
+    return { ok: false, dex: "stonfi", error: sellGuard.error };
+  }
+
   const router = client.open(DEX.v1.Router.create(STONFI_ROUTER_ADDR));
   const proxyTon = new pTON.v1();
 
@@ -236,9 +276,11 @@ async function dedustBuy(
     return { ok: false, dex: "dedust", error: "DeDust not available on testnet (no public factory) — use stonfi" };
   }
   const bal = await w.getBalance();
-  const reqd = BigInt(toNano((p.amountTon + 0.25).toString()));
-  if (bal < reqd) {
-    throw new Error(`insufficient balance have=${fromNano(bal)} need=${fromNano(reqd)}`);
+  // Mirror of stonfiBuy — same EXIT_RESERVE_TON reservation for the
+  // worst-case exit. See swap-gas-guard.ts.
+  const guard = evaluateBuyGasGuard(Number(fromNano(bal)), p.amountTon);
+  if (!guard.ok) {
+    throw new Error(guard.error);
   }
 
   const factory = client.open(Factory.createFromAddress(DEDUST_FACTORY_ADDR!));
@@ -314,6 +356,16 @@ async function dedustSell(
   }
   if (!p.jettonAmountNano) {
     throw new Error("jettonAmountNano is required for sell swap");
+  }
+
+  // Worst-case exit-reserve preflight (mirror of stonfiSell above).
+  // DeDust sends 0.35 TON explicitly per sell; we check that floor
+  // instead of letting `sendTransferLocked` fail downstream at broadcast.
+  const sellBal = await w.getBalance();
+  const sellGuard2 = evaluateSellGasGuard(Number(fromNano(sellBal)));
+  if (!sellGuard2.ok) {
+    log.err("DEDUST", `[${tier.toUpperCase()}] sell REFUSED: ${sellGuard2.error}`);
+    return { ok: false, dex: "dedust", error: sellGuard2.error };
   }
 
   const factory = client.open(Factory.createFromAddress(DEDUST_FACTORY_ADDR!));
