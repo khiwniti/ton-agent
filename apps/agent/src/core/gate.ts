@@ -12,6 +12,10 @@
  * and forwards them here.
  */
 import type { TierRiskConfig } from "../risk/guardrails";
+import {
+  BANKROLL_FLOOR_TON,
+  effectiveBuyReserveTon,
+} from "../dex/swap-gas-guard";
 
 export type Tier = "low" | "mid" | "high";
 export const ALL_TIERS: Tier[] = ["low", "mid", "high"];
@@ -22,6 +26,18 @@ export const ALL_TIERS: Tier[] = ["low", "mid", "high"];
  * A jetton buy on Ston.fi/DeDust forwards ~0.2–0.25 TON; 0.3 is the safe floor.
  */
 export const GAS_CUSHION_TON = 0.3;
+
+/**
+ * Effective per-trade reserve that the bankroll floor policy mandates stay
+ * untouched after any successful buy. Defaults from
+ * `effectiveBuyReserveTon()` (= max of EXIT_RESERVE_TON / BANKROLL_FLOOR_TON).
+ * Kept here as a named constant so the gate's reasoning reads consistently
+ * with the router-side pre-flight in dex/swap-gas-guard.ts.
+ */
+export const TRADE_RESERVE_TON = effectiveBuyReserveTon();
+
+/** Re-export of the operator-configurable bankroll floor for downstream gates. */
+export { BANKROLL_FLOOR_TON };
 
 export interface TierHandle {
   tier: Tier;
@@ -86,13 +102,18 @@ export function evaluateTradeGate(input: TradeGateInput): TradeGateResult {
     };
   }
   // Reserve GAS_CUSHION_TON on top of the position so the buy doesn't fail
-  // mid-broadcast on gas/forward fees. The reason string reports the exact
-  // threshold the code checks (previously it lied — checked +0.01, said +0.3).
-  const needTon = requestedTon + GAS_CUSHION_TON;
+  // mid-broadcast on gas/forward fees, AND TRADE_RESERVE_TON so the wallet
+  // never drops below the operator's bankroll floor. The reason string
+  // reports the exact threshold the code checks — previously it only
+  // checked requestedTon+0.3 and silently let the buy drain the wallet
+  // past the floor (the user's "lost all orders" worst case).
+  const needTon = requestedTon + GAS_CUSHION_TON + TRADE_RESERVE_TON;
   if (handle.balanceTon < needTon) {
     return {
       allowed: false,
-      reason: `insufficient balance ${handle.balanceTon} < ${needTon}`,
+      reason:
+        `insufficient balance ${handle.balanceTon} < ${needTon} ` +
+        `(requested=${requestedTon} + gas-cushion=${GAS_CUSHION_TON} + trade-reserve=${TRADE_RESERVE_TON})`,
     };
   }
   if (handle.openPositions >= handle.config.maxOpen) {

@@ -24,7 +24,9 @@ import { makeClient } from "../wallet/wallet";
 import { log } from "../logger";
 import { CONFIG } from "../config";
 import { getJetton, fullAudit } from "../security/audit";
-import { executeSwap } from "../dex/router";
+import { executeSwap, getSwapQuote, type Dex } from "../dex/router";
+import { resolvePool } from "../security/pool-resolver";
+import { Address, fromNano } from "@ton/ton";
 import {
   positionsStore,
   dailyPnlStore,
@@ -43,6 +45,7 @@ import {
   type ExitPolicyContext,
 } from "../exit/policy-engine";
 import { runMonitor as runLegacyMonitor } from "../wallet/position-manager";
+import { SELL_GAS_FLOOR_TON } from "../dex/swap-gas-guard";
 
 /**
  * Push a position-shaped update to the web with the row id as the
@@ -169,22 +172,88 @@ export async function runMonitor() {
       return;
     }
 
+    // Dry-wallet short-circuit: if the LOW-tier wallet cannot afford even
+    // a single sell (gas floor), every per-position `executeSwap` below
+    // would be refused by dex/swap-gas-guard's evaluateSellGasGuard anyway.
+    // Skip the whole tick to avoid burning getJetton/SwapQuote/journal
+    // cycles on stuck positions. The next tick re-checks on top-up.
+    //
+    // We only short-circuit when the coordinator is up (e.g. ≥1 tier
+    // handle initialized). Otherwise the legacy path handles it.
+    if (isCoordinatorStarted()) {
+      try {
+        const lowHandle = getCoordinator().getTierHandle("low");
+        if (lowHandle?.address) {
+          const dryBal = await client.getBalance(Address.parse(lowHandle.address));
+          const dryBalTon = Number(fromNano(dryBal));
+          if (dryBalTon < SELL_GAS_FLOOR_TON) {
+            log.warn(
+              "MGR",
+              `dry-wallet short-circuit: LOW balance=${dryBalTon.toFixed(3)} TON < SELL_GAS_FLOOR=${SELL_GAS_FLOOR_TON} TON — skipping entire tick until topped up`,
+            );
+            return;
+          }
+          if (dryBalTon < SELL_GAS_FLOOR_TON * 2) {
+            // Above floor but tight — log info so operators can see the
+            // gap before it crosses the floor. Still processes positions.
+            log.info(
+              "MGR",
+              `LOW balance=${dryBalTon.toFixed(3)} TON is tight against sell-gas floor ${SELL_GAS_FLOOR_TON} TON — top up soon`,
+            );
+          }
+        }
+      } catch (e: any) {
+        // Balance check is best-effort; failing here just falls through to
+        // the per-position logic, where each executeSwap will refuse cleanly.
+        log.debug("MGR", `dry-wallet check skipped (balance read failed): ${e.message}`);
+      }
+    }
+
     const openPositions = positionsStore.listOpen();
     for (const p of openPositions) {
       try {
         const tier = p.wallet_tier as Tier;
         const cfg = TIER_RISK_CONFIGS[tier];
 
-        // ── Price (cheap TONAPI call) ────────────────────────────────────
-        const meta = await getJetton(p.jetton_master);
-        if (!meta) continue;
-        const curUsd = meta?.market_data?.price;
-        if (curUsd == null) continue;
+        // ── Price (TON pool quote first, fallback to USD if quote unavailable) ──────
+        const dex: Dex = (p.dex as any) || CONFIG.strategy.preferredDex;
+        let pnl: number | null = null;
+        let curTon: number = p.current_price_ton ?? p.entry_price_ton;
+        let curUsd: number | undefined;
 
-        const entryUsd = p.entry_price_usd!;
-        const pnl =
-          ((curUsd - entryUsd) / entryUsd) * 100;
-        const curTon = (1 + pnl / 100) * p.entry_price_ton;
+        try {
+          const poolResolved = await resolvePool(client, Address.parse(p.jetton_master));
+          if (poolResolved.poolAddress) {
+            const quote = await getSwapQuote(
+              client,
+              { dex, poolAddress: poolResolved.poolAddress },
+              "sell",
+              p.amount_tokens,
+              p.jetton_master,
+            );
+            if (quote && quote.available) {
+              curTon = Number(fromNano(quote.expectedOutNano));
+              const costBasis = p.cost_basis_ton > 0 ? p.cost_basis_ton : (p.entry_price_ton * Number(BigInt(p.amount_tokens)) / 1e9);
+              if (costBasis > 0) {
+                pnl = ((curTon - costBasis) / costBasis) * 100;
+              }
+            }
+          }
+        } catch {
+          // Quote fetch failed — fall back to USD price
+        }
+
+        const entryUsd = p.entry_price_usd ?? 1;
+        if (pnl == null) {
+          const meta = await getJetton(p.jetton_master);
+          curUsd = meta?.market_data?.price;
+          if (curUsd != null && p.entry_price_usd && p.entry_price_usd > 0) {
+            pnl = ((curUsd - p.entry_price_usd) / p.entry_price_usd) * 100;
+            curTon = (1 + pnl / 100) * p.entry_price_ton;
+          }
+        }
+
+        if (pnl == null) continue; // Fail closed if neither quote nor USD is available
 
         log.debug(
           "MGR",
@@ -210,7 +279,7 @@ export async function runMonitor() {
         // ── Pure exit-policy evaluation ───────────────────────────────────
         const ctx: ExitPolicyContext = {
           now: Date.now(),
-          currentPriceUsd: curUsd,
+          currentPriceUsd: curUsd ?? entryUsd * (1 + pnl / 100),
           entryPriceUsd: entryUsd,
           tierCfg: cfg,
           auditVerdict,
@@ -247,17 +316,27 @@ export async function runMonitor() {
           ? p.amount_tokens
           : (BigInt(p.amount_tokens) / 2n).toString();
 
-        const res = await executeSwap(
-          client,
-          {
-            jettonMaster: p.jetton_master,
-            amountTon: 0.1, // unused for sell
-            side: "sell",
-            jettonAmountNano: sellTokens,
-          },
-          tier,
-          (p.dex as any) || CONFIG.strategy.preferredDex,
-        );
+        const swapReq = {
+          jettonMaster: p.jetton_master,
+          amountTon: 0.1, // unused for sell
+          side: "sell" as const,
+          jettonAmountNano: sellTokens,
+          minOutJettonNano: "0",
+        };
+
+        const res = isCoordinatorStarted()
+          ? await getCoordinator().executeForTier(
+              tier,
+              swapReq,
+              dex,
+              { isExit: true }
+            )
+          : await executeSwap(
+              client,
+              swapReq,
+              tier,
+              dex,
+            );
 
         if (!res.ok) {
           // Swap failed — leave the position OPEN so a later tick can retry,

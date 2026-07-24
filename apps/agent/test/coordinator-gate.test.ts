@@ -213,22 +213,39 @@ test("HIGH tier allows up to its 5.0 TON cap inclusive", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// 6. Bankroll insufficiency (gas headroom of 0.3 TON baked in)
+// 6. Bankroll insufficiency (gas headroom of 0.3 TON baked in, plus
+//    TRADE_RESERVE_TON = max(EXIT_RESERVE, BANKROLL_FLOOR) so the wallet
+//    never drops below the operator's bankroll floor — even at this gate,
+//    before any router-side pre-flight runs).
 // ─────────────────────────────────────────────────────────────────────
-test("balance under (requested + 0.3 gas) is denied", () => {
-  // requested=0.5 → needs ≥ 0.8 TON. Hand it 0.79.
+test("balance under (requested + cushion + trade reserve) is denied", () => {
+  // requested=0.5 → needs ≥ 0.5 + 0.3 + 1.0 (BANKROLL_FLOOR effective) = 1.8 TON.
+  // Hand it 1.79.
   const r = evaluateTradeGate(
-    baseInput({ requestedTon: 0.5, handle: makeHandle({ balanceTon: 0.79 }) }),
+    baseInput({ requestedTon: 0.5, handle: makeHandle({ balanceTon: 1.79 }) }),
   );
   assert.equal(r.allowed, false);
-  assert.match(r.reason!, /insufficient balance 0.79 < 0.8/);
+  assert.match(r.reason!, /insufficient balance 1\.79 < 1\.8/);
+  // Reports the breakdown so operators know why the buy was refused.
+  assert.match(r.reason!, /trade-reserve=1/);
 });
 
-test("balance exactly (requested + 0.3) is allowed", () => {
+test("balance exactly (requested + cushion + trade reserve) is allowed", () => {
   const r = evaluateTradeGate(
-    baseInput({ requestedTon: 0.5, handle: makeHandle({ balanceTon: 0.8 }) }),
+    baseInput({ requestedTon: 0.5, handle: makeHandle({ balanceTon: 1.8 }) }),
   );
   assert.equal(r.allowed, true);
+});
+
+test("balance below bankroll floor at all → denied even on tiny positions", () => {
+  // Operator bankroll floor (1 TON) is the strictest constraint. Even a
+  // 0.01 TON position on a 1.25 TON wallet is refused because the buy
+  // would leave < 1 TON behind (0.01 + 0.3 + 1.0 = 1.31 > 1.25).
+  const r = evaluateTradeGate(
+    baseInput({ requestedTon: 0.01, handle: makeHandle({ balanceTon: 1.25 }) }),
+  );
+  assert.equal(r.allowed, false);
+  assert.match(r.reason!, /insufficient balance/);
 });
 
 // ─────────────────────────────────────────────────────────────────────

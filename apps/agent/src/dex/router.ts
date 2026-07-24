@@ -91,7 +91,6 @@ export interface SwapRequest {
 }
 
 import {
-  EXIT_RESERVE_TON,
   evaluateBuyGasGuard,
   evaluateSellGasGuard,
 } from "./swap-gas-guard";
@@ -276,8 +275,9 @@ async function dedustBuy(
     return { ok: false, dex: "dedust", error: "DeDust not available on testnet (no public factory) — use stonfi" };
   }
   const bal = await w.getBalance();
-  // Mirror of stonfiBuy — same EXIT_RESERVE_TON reservation for the
-  // worst-case exit. See swap-gas-guard.ts.
+  // Mirror of stonfiBuy — same worst-case exit reservation floor.
+  // See swap-gas-guard.ts (effectiveBuyReserveTon = max(EXIT_RESERVE,
+  // BANKROLL_FLOOR)) so the stricter floor always wins.
   const guard = evaluateBuyGasGuard(Number(fromNano(bal)), p.amountTon);
   if (!guard.ok) {
     throw new Error(guard.error);
