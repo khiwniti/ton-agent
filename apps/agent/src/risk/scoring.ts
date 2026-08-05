@@ -1,17 +1,21 @@
 /**
- * Confidence scoring engine.
+ * Confidence scoring engine - 100% baseline subtractive model.
  *
- * Computes a 0-100 score for each trade opportunity based on:
- *   • Security audit results  (renounced, lpLocked, honeypotSafe)
- *   • Holder count            (distribution breadth)
- *   • Token age               (time since creation)
- *   • Pool liquidity          (available depth)
- *   • Pool availability       (can we trade it?)
- *   • Tier minimum threshold  (does the score meet the tier's minAiScore?)
+ * Computes a 0-100 confidence score starting from 100% and subtracting
+ * for each risk factor. This better reflects risk accumulation:
+ * "How much confidence do we lose?"
  *
- * The score is purely informational — it does NOT gate execution (the audit
- * booleans + risk gate do that). It IS stored alongside every position so
- * operators can sort/filter by quality and the dashboard can show a badge.
+ * Scoring formula:
+ *   Start at 100% confidence
+ *   Subtract for each risk factor:
+ *   - Audit failures (critical): renounce (-25%), LP unlock (-30%), honeypot (-40%)
+ *   - Weak distribution: <10 holders (-15%), <100 holders (-10%), <500 holders (-5%)
+ *   - New token risk: <1hr (-15%), <12hr (-10%), <24hr (-5%)
+ *   - Low liquidity: <10 TON (-10%), <100 TON (-5%)
+ *   - Data unavailable: -20% per missing critical data point
+ *
+ * Minimum to trade: 70% confidence
+ * Ideal trades: 85%+ confidence
  */
 
 export interface ConfidenceInput {
@@ -37,89 +41,183 @@ export interface ConfidenceInput {
  * Score components breakdown — useful for logging and dashboard display.
  */
 export interface ScoreBreakdown {
-  total: number;
-  audit: number;       // 0-60
-  holders: number;     // 0-15
-  age: number;         // 0-15
-  liquidity: number;   // 0-10
-  tierBonus: number;   // 0-10
+  total: number;           // Final confidence percentage (0-100)
+  auditDeduction: number;  // Deduction for audit failures
+  holdersDeduction: number; // Deduction for weak distribution
+  ageDeduction: number;    // Deduction for new token risk
+  liquidityDeduction: number; // Deduction for low liquidity
+  dataGapDeduction: number; // Deduction for missing data
+  baseConfidence: number;  // Starting confidence before deductions
+  
+  // Backward compatibility - map old additive properties to new subtractive model
+  audit: number;       // Legacy: 0-60 additive (now: 60 - auditDeduction)
+  holders: number;     // Legacy: 0-15 additive (now: 15 - holdersDeduction) 
+  age: number;         // Legacy: 0-15 additive (now: 15 - ageDeduction)
+  liquidity: number;   // Legacy: 0-10 additive (now: 10 - liquidityDeduction)
+  tierBonus: number;   // Legacy: 0-10 additive (now: 0 - no bonus in subtractive model)
 }
 
 /**
- * Compute a 0-100 confidence score for a trade opportunity.
+ * Compute a 0-100 confidence score using 100% baseline subtractive model.
  *
- * Scoring formula:
- *   audit    (0-60)  — 20 pts each for renounced / LP locked / honeypot-safe
- *   holders  (0-15)  — logarithmic tiers based on distribution breadth
- *   age      (0-15)  — older tokens get more points (established)
- *   liquidity(0-10)  — deeper pools are safer
- *   tierBonus(0-10)  — extra points when the base score already meets the
- *                       tier's minAiScore threshold (alignment bonus)
- *
- * Returns the raw total (0-100) and the component breakdown.
+ * Returns the final confidence percentage and the deduction breakdown.
  */
 export function computeConfidenceScore(input: ConfidenceInput): ScoreBreakdown {
-  // ── 1. Audit (0-60) — each of the three hard gates contributes 20 pts ──
-  let audit = 0;
-  if (input.renounced) audit += 20;
-  if (input.lpLocked) audit += 20;
-  if (input.honeypotSafe) audit += 20;
+  const baseConfidence = 100;
+  let auditDeduction = 0;
+  let holdersDeduction = 0;
+  let ageDeduction = 0;
+  let liquidityDeduction = 0;
+  let dataGapDeduction = 0;
 
-  // ── 2. Holders (0-15) — logarithmic breadth distribution ──
-  let holders = 0;
-  if (input.holders >= 10_000) holders = 15;
-  else if (input.holders >= 5_000) holders = 13;
-  else if (input.holders >= 1_000) holders = 11;
-  else if (input.holders >= 500) holders = 9;
-  else if (input.holders >= 100) holders = 7;
-  else if (input.holders >= 50) holders = 5;
-  else if (input.holders >= 10) holders = 3;
-  else if (input.holders > 0) holders = 1;
+  // ── 1. Audit Deductions (Critical) ──
+  if (!input.renounced) auditDeduction += 25;  // Non-renounced ownership
+  if (!input.lpLocked) auditDeduction += 30;   // Unlocked liquidity pool
+  if (!input.honeypotSafe) auditDeduction += 40; // Honeypot risk
 
-  // ── 3. Token age (0-15) — older = more established ──
-  let age = 0;
-  if (input.ageHours >= 720) age = 15;     // 30+ days
-  else if (input.ageHours >= 336) age = 13; // 14+ days
-  else if (input.ageHours >= 168) age = 10; // 7+ days
-  else if (input.ageHours >= 72) age = 8;   // 3+ days
-  else if (input.ageHours >= 48) age = 6;   // 2+ days
-  else if (input.ageHours >= 24) age = 5;   // 1+ day
-  else if (input.ageHours >= 12) age = 3;   // 12+ hours
-  else if (input.ageHours >= 6) age = 2;    // 6+ hours
-  else if (input.ageHours >= 1) age = 1;
-  // ageHours === 0 → no data, keep age=0
+  // ── 2. Holder Distribution Deductions ──
+  if (input.holders < 10) holdersDeduction += 15;     // Very concentrated
+  else if (input.holders < 100) holdersDeduction += 10; // Weak distribution
+  else if (input.holders < 500) holdersDeduction += 5;  // Limited distribution
 
-  // ── 4. Liquidity (0-10) — pool depth ──
-  let liquidity = 0;
-  if (input.poolAvailable && input.liquidityTon != null) {
-    if (input.liquidityTon >= 500_000) liquidity = 10;
-    else if (input.liquidityTon >= 100_000) liquidity = 9;
-    else if (input.liquidityTon >= 50_000) liquidity = 8;
-    else if (input.liquidityTon >= 10_000) liquidity = 7;
-    else if (input.liquidityTon >= 5_000) liquidity = 6;
-    else if (input.liquidityTon >= 1_000) liquidity = 5;
-    else if (input.liquidityTon >= 500) liquidity = 4;
-    else if (input.liquidityTon >= 100) liquidity = 3;
-    else if (input.liquidityTon >= 10) liquidity = 2;
-    else liquidity = 1;
+  // ── 3. Token Age Deductions ──
+  if (input.ageHours === 0 || !Number.isFinite(input.ageHours)) {
+    ageDeduction += 15; // Unknown/brand new - highest risk
+  } else if (input.ageHours < 1) ageDeduction += 15;    // < 1 hour old
+  else if (input.ageHours < 12) ageDeduction += 10;   // < 12 hours old
+  else if (input.ageHours < 24) ageDeduction += 5;    // < 24 hours old
+
+  // ── 4. Liquidity Deductions ──
+  if (!input.poolAvailable || input.liquidityTon === null) {
+    liquidityDeduction += 10; // No pool or unknown liquidity
+  } else if (input.liquidityTon < 10) liquidityDeduction += 10;  // Very low liquidity
+  else if (input.liquidityTon < 100) liquidityDeduction += 5;  // Low liquidity
+
+  // ── 5. Data Gap Deductions ──
+  if (!Number.isFinite(input.holders) || input.holders <= 0) dataGapDeduction += 20;
+  if (!Number.isFinite(input.ageHours) || input.ageHours <= 0) dataGapDeduction += 20;
+
+  // ── Calculate Final Confidence ──
+  const totalDeduction = auditDeduction + holdersDeduction + ageDeduction + 
+                         liquidityDeduction + dataGapDeduction;
+  const total = Math.max(0, Math.min(100, baseConfidence - totalDeduction));
+
+  // ── Backward Compatibility: Calculate legacy additive properties ──
+  const audit = Math.max(0, 60 - auditDeduction);       // Map to 0-60 range
+  const holders = Math.max(0, 15 - holdersDeduction);   // Map to 0-15 range
+  const age = Math.max(0, 15 - ageDeduction);           // Map to 0-15 range
+  const liquidity = Math.max(0, 10 - liquidityDeduction); // Map to 0-10 range
+  const tierBonus = 0; // No tier bonus in subtractive model
+
+  return { 
+    total, 
+    auditDeduction, 
+    holdersDeduction, 
+    ageDeduction, 
+    liquidityDeduction, 
+    dataGapDeduction,
+    baseConfidence,
+    // Backward compatibility
+    audit,
+    holders,
+    age,
+    liquidity,
+    tierBonus
+  };
+}
+
+export interface ExecutionConfidenceResult { 
+  allowed: boolean; 
+  reason?: string; 
+  requiredScore: number; 
+  score: ScoreBreakdown; 
+}
+
+const configuredNumber = (key: string, fallback: number) => { 
+  const value = Number(process.env[key]); 
+  return Number.isFinite(value) && value >= 0 ? value : fallback; 
+};
+
+/** Minimum confidence percentage to execute a trade (default: 70%) */
+export const MIN_EXECUTION_CONFIDENCE_SCORE = Math.min(100, configuredNumber("MIN_EXECUTION_CONFIDENCE_SCORE", 70));
+
+/** Minimum pool liquidity in TON to execute a trade (default: 50 TON) */
+export const MIN_EXECUTABLE_POOL_LIQUIDITY_TON = configuredNumber("MIN_EXECUTABLE_POOL_LIQUIDITY_TON", 50);
+
+/**
+ * Evaluate execution confidence using the 100% baseline model.
+ * 
+ * Critical gates (hard failures):
+ * - Honeypot unsafe (immediate rejection)
+ * - LP not locked (immediate rejection)
+ * - No executable pool (immediate rejection)
+ * 
+ * Advisory gates (reduce confidence but don't hard-fail):
+ * - Non-renounced ownership (-25% deduction)
+ * - Weak distribution (-5% to -15% deduction)
+ * - New token (-5% to -15% deduction)
+ * - Low liquidity (-5% to -10% deduction)
+ */
+export function evaluateExecutionConfidence(input: ConfidenceInput): ExecutionConfidenceResult {
+  const score = computeConfidenceScore(input);
+  const requiredScore = Math.max(input.minAiScore, MIN_EXECUTION_CONFIDENCE_SCORE);
+
+  // Critical hard gates - these are immediate failures
+  if (!input.honeypotSafe) {
+    return { 
+      allowed: false, 
+      reason: "honeypot detection failed - critical security risk", 
+      requiredScore, 
+      score 
+    };
   }
-  // If pool is available but liquidity is unknown, give a small base point
-  if (input.poolAvailable && liquidity === 0) liquidity = 1;
 
-  // ── 5. Tier alignment bonus (0-10) ──
-  const baseScore = audit + holders + age + liquidity;
-  let tierBonus = 0;
-  if (baseScore >= input.minAiScore) {
-    // Score already meets threshold — bonus for alignment
-    if (baseScore >= 90) tierBonus = 10;
-    else if (baseScore >= 80) tierBonus = 8;
-    else if (baseScore >= 70) tierBonus = 6;
-    else if (baseScore >= 60) tierBonus = 4;
-    else tierBonus = 2;
+  if (!input.lpLocked) {
+    return { 
+      allowed: false, 
+      reason: "liquidity pool not locked - rug pull risk", 
+      requiredScore, 
+      score 
+    };
   }
 
-  // ── Clamp to 0-100 ──
-  const total = Math.min(100, Math.max(0, baseScore + tierBonus));
+  if (!input.poolAvailable) {
+    return { 
+      allowed: false, 
+      reason: "no resolved executable pool", 
+      requiredScore, 
+      score 
+    };
+  }
 
-  return { total, audit, holders, age, liquidity, tierBonus };
+  // Advisory gates - these reduce confidence but allow trading if score is high enough
+  if (input.liquidityTon === null || !Number.isFinite(input.liquidityTon)) {
+    return { 
+      allowed: false, 
+      reason: "pool liquidity is unavailable — fail closed", 
+      requiredScore, 
+      score 
+    };
+  }
+
+  if (input.liquidityTon < MIN_EXECUTABLE_POOL_LIQUIDITY_TON) {
+    return { 
+      allowed: false, 
+      reason: `pool liquidity ${input.liquidityTon} TON < minimum ${MIN_EXECUTABLE_POOL_LIQUIDITY_TON} TON`, 
+      requiredScore, 
+      score 
+    };
+  }
+
+  // Check final confidence score
+  if (score.total < requiredScore) {
+    return { 
+      allowed: false, 
+      reason: `confidence ${score.total}% < required ${requiredScore}% (deductions: audit=${score.auditDeduction}%, holders=${score.holdersDeduction}%, age=${score.ageDeduction}%, liquidity=${score.liquidityDeduction}%, data=${score.dataGapDeduction}%)`, 
+      requiredScore, 
+      score 
+    };
+  }
+
+  return { allowed: true, requiredScore, score };
 }

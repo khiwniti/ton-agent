@@ -106,3 +106,30 @@ export const CONFIG = {
 };
 
 export const isTestnet = () => CONFIG.network === "testnet";
+
+/**
+ * Variables required by the long-running production agent. Supabase
+ * credentials are intentionally excluded: they belong to the separately
+ * deployed web app, while the agent authenticates through its webhook.
+ */
+export function getMissingRuntimeEnv(): string[] {
+    const missing: string[] = [];
+    const requireAny = (label: string, ...keys: string[]) => {
+        if (!keys.some((key) => process.env[key]?.trim())) missing.push(label);
+    };
+
+    requireAny("WALLET_MASTER_MNEMONIC (or WALLET_MNEMONIC)", "WALLET_MASTER_MNEMONIC", "WALLET_MNEMONIC");
+    requireAny("AGENT_SHARED_SECRET", "AGENT_SHARED_SECRET");
+    requireAny("PUBLIC_WEBHOOK_URL", "PUBLIC_WEBHOOK_URL");
+    requireAny("NVIDIA_API_KEY (or OPENAI_API_KEY or ANTHROPIC_API_KEY)", "NVIDIA_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY");
+
+    return missing;
+}
+
+export function assertRuntimeEnv(): void {
+    const missing = getMissingRuntimeEnv();
+    if (missing.length > 0) {
+        throw new Error(`Missing required runtime environment variables: ${missing.join(", ")}`);
+    }
+}
+
