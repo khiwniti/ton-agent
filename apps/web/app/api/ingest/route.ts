@@ -2,21 +2,23 @@ import { NextRequest, NextResponse } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { isSupabaseNotConfigured } from "@/lib/supabase/sentinel";
 import { mapIngest } from "@/lib/ingest";
+import { verifyIngestSignature } from "@/lib/ingest-auth";
 import type { IngestBody } from "@/lib/types";
 
 const NOT_CONFIGURED_MSG =
   "Supabase is not configured. Set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in the web app environment.";
 
 export async function POST(req: NextRequest) {
-  const secretHeader = req.headers.get("x-agent-secret");
-  const expectedSecret = process.env.AGENT_SHARED_SECRET;
+  const secret = process.env.AGENT_SHARED_SECRET;
+  const signature = req.headers.get("x-agent-secret");
+  const rawBody = await req.text();
 
-  if (!expectedSecret || secretHeader !== expectedSecret) {
+  if (!verifyIngestSignature(rawBody, signature, secret)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
   try {
-    const body: IngestBody = await req.json();
+    const body: IngestBody = JSON.parse(rawBody);
     if (!body || !body.kind || !body.payload) {
       return NextResponse.json({ error: "Invalid body shape" }, { status: 400 });
     }
