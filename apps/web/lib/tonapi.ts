@@ -8,7 +8,10 @@
  * returning null / empty rather than throwing — the UI is informational.
  */
 
-const BASE = process.env.NEXT_PUBLIC_TONAPI_BASE || "https://tonapi.io/v2";
+const NETWORK = process.env.NEXT_PUBLIC_NETWORK || process.env.NETWORK || "mainnet";
+const isTestnet = NETWORK === "testnet";
+const DEFAULT_BASE = isTestnet ? "https://testnet.tonapi.io/v2" : "https://tonapi.io/v2";
+const BASE = process.env.NEXT_PUBLIC_TONAPI_BASE || DEFAULT_BASE;
 const KEY = process.env.NEXT_PUBLIC_TONAPI_KEY || "";
 
 async function tonApiGet(path: string): Promise<any> {

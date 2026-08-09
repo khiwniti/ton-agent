@@ -56,15 +56,20 @@ const bool = (k: string, fb: boolean) => {
     return v.toLowerCase() === "true" || v === "1";
 };
 
+const network = opt("NETWORK", "mainnet") as "mainnet" | "testnet";
+const defaultRpc = network === "testnet"
+    ? "https://testnet.toncenter.com/api/v2/jsonRPC"
+    : "https://toncenter.com/api/v2/jsonRPC";
+const defaultTonapiBase = network === "testnet"
+    ? "https://testnet.tonapi.io/v2"
+    : "https://tonapi.io/v2";
+
 export const CONFIG = {
-    network: opt("NETWORK", "mainnet") as "mainnet" | "testnet",
-    rpcEndpoint: opt(
-        "TON_RPC_ENDPOINT",
-        "https://toncenter.com/api/v2/jsonRPC"
-    ),
+    network,
+    rpcEndpoint: opt("TON_RPC_ENDPOINT", defaultRpc),
     tonApiKey: opt("TON_API_KEY", ""),
     tonapiKey: opt("TONAPI_KEY", ""),
-    tonapiBase: opt("TONAPI_BASE", "https://tonapi.io/v2"),
+    tonapiBase: opt("TONAPI_BASE", defaultTonapiBase),
     mnemonic: reqAny("WALLET_MASTER_MNEMONIC", "WALLET_MNEMONIC"),
     walletVersion: opt("WALLET_VERSION", "v5r1") as "v3r2" | "v4r2" | "v5r1",
     walletSubwalletId: num("WALLET_SUBWALLET_ID", 698983191),

@@ -50,8 +50,14 @@ export interface BuiltSwap {
   validUntil: number;
 }
 
-// Ston.fi's mainnet v1 router address (fixed).
-const STONFI_V1_ROUTER = "EQB3ncyBUTjZUAUOTn7f_yB-s5SscCjH-M-6f9Z6P3Z-1p";
+// Resolve network dynamically for server-side Next.js runtime.
+const NETWORK = process.env.NETWORK || process.env.NEXT_PUBLIC_NETWORK || "mainnet";
+const isTestnet = NETWORK === "testnet";
+
+// Ston.fi's v1 router address: testnet vs mainnet.
+const STONFI_V1_ROUTER = isTestnet
+  ? "kQBsGx9ArADUrREB34W-ghgsCgBShvfUr4Jvlu-0KGc33a1n"
+  : "EQB3ncyBUTjZUAUOTn7f_yB-s5SscCjH-M-6f9Z6P3Z-1p";
 
 /**
  * Builds a Ston.fi TON→Jetton swap body.
