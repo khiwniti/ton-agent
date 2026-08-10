@@ -98,6 +98,19 @@ export interface SecurityReport {
   holders: number;
   ageHours: number;
   ok: boolean;
+  // Detailed audit dimensions for the hot-path monitor (exit policy engine)
+  dataAvailable: boolean;
+  dataUnavailableReason?: string;
+  lpLockedDetail: {
+    passed: boolean;
+    state: "locked" | "unlocked" | "undetermined";
+  };
+  honeypotSafeDetail: {
+    passed: boolean;
+  };
+  renouncedDetail: {
+    passed: boolean;
+  };
 }
 
 export async function fullAudit(client: TonClient, master: string, pool?: string): Promise<SecurityReport> {
@@ -107,12 +120,69 @@ export async function fullAudit(client: TonClient, master: string, pool?: string
     m = Address.parse(master);
   } catch {
     log.warn("SEC", `fullAudit: invalid master address "${master?.slice(0, 20) ?? '?'}"`);
-    return { renounced: false, lpLocked: false, honeypotSafe: false, holders: 0, ageHours: 0, ok: false };
+    return {
+      renounced: false,
+      lpLocked: false,
+      honeypotSafe: false,
+      holders: 0,
+      ageHours: 0,
+      ok: false,
+      dataAvailable: false,
+      dataUnavailableReason: "invalid master address",
+      lpLockedDetail: { passed: false, state: "undetermined" },
+      honeypotSafeDetail: { passed: false },
+      renouncedDetail: { passed: false },
+    };
   }
+
+  // Track data availability
+  let dataAvailable = true;
+  let dataUnavailableReason: string | undefined;
+
   const meta = await getJetton(master);
-  const renounced = await checkRenounced(client, m);
-  const lpLocked = pool ? await checkLpLocked(Address.parse(pool)) : false;
-  const honeypotSafe = pool ? await checkHoneypot(m, Address.parse(pool)) : true;
+
+  // Renounce check
+  let renounced = false;
+  try {
+    renounced = await checkRenounced(client, m);
+  } catch (e: any) {
+    log.warn("SEC", `renounce check failed: ${e.message}`);
+    dataAvailable = false;
+    dataUnavailableReason = "renounce check failed";
+  }
+
+  // LP lock check
+  let lpLocked = false;
+  let lpState: "locked" | "unlocked" | "undetermined" = "undetermined";
+  if (pool) {
+    try {
+      lpLocked = await checkLpLocked(Address.parse(pool));
+      lpState = lpLocked ? "locked" : "unlocked";
+    } catch (e: any) {
+      log.warn("SEC", `lp lock check failed: ${e.message}`);
+      dataAvailable = false;
+      dataUnavailableReason = "lp lock check failed";
+    }
+  } else {
+    dataAvailable = false;
+    dataUnavailableReason = "no pool provided";
+    lpState = "undetermined";
+  }
+
+  // Honeypot check
+  let honeypotSafe = true;
+  if (pool) {
+    try {
+      honeypotSafe = await checkHoneypot(m, Address.parse(pool));
+    } catch (e: any) {
+      log.warn("SEC", `honeypot check failed: ${e.message}`);
+      dataAvailable = false;
+      dataUnavailableReason = "honeypot check failed";
+    }
+  } else {
+    dataAvailable = false;
+    dataUnavailableReason = "no pool provided";
+  }
 
   const rep: SecurityReport = {
     renounced,
@@ -121,7 +191,14 @@ export async function fullAudit(client: TonClient, master: string, pool?: string
     holders: meta?.holders_count ?? 0,
     ageHours: 0, // TONAPI doesn't expose exact timestamp; we infer via DeepScan when needed
     ok: renounced && lpLocked && honeypotSafe,
+    dataAvailable,
+    dataUnavailableReason,
+    lpLockedDetail: { passed: lpLocked, state: lpState },
+    honeypotSafeDetail: { passed: honeypotSafe },
+    renouncedDetail: { passed: renounced },
   };
   log.ok("SEC", `audit ${master.slice(0,8)}…: ${JSON.stringify(rep)}`);
   return rep;
 }
+
+export const fullAuditDetail = fullAudit;

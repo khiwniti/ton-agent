@@ -56,7 +56,7 @@ test("journal append records exit decision", () => {
   assert.equal(entry?.agent, "position-monitor");
 });
 
-test("exit policy: emergency_exit fires on rug verdict", () => {
+test("exit policy: emergency_exit fires on measured rug delta", () => {
   const cfg = TIER_RISK_CONFIGS.low;
   const decision = evaluateExitPolicy(
     {
@@ -70,7 +70,8 @@ test("exit policy: emergency_exit fires on rug verdict", () => {
       currentPriceUsd: 100,
       entryPriceUsd: 100,
       tierCfg: cfg,
-      auditVerdict: { ok: false, honeypotSafe: false, lpLocked: false, renounced: false },
+      auditVerdict: { ok: true, honeypotSafe: true, lpLocked: true, renounced: true },
+      rugSignal: { rugged: true, reason: "liquidity drain: -62% vs high-water mark" },
       maxHoldMs: null,
     }
   );
@@ -80,7 +81,10 @@ test("exit policy: emergency_exit fires on rug verdict", () => {
   assert.equal(decision?.sellFraction, 1.0);
 });
 
-test("exit policy: TP1 halves sell fraction and cost scale", () => {
+test("exit policy: a +25% winner rides the trend (no TP ladder)", () => {
+  // Operator directive 2026-08-09: take-profit ladder GONE. A +25% winner
+  // with a healthy trend must NOT fire any exit — it rides until the trend
+  // flips or the stop-loss floor breaks.
   const cfg = TIER_RISK_CONFIGS.low;
   const decision = evaluateExitPolicy(
     {
@@ -95,14 +99,12 @@ test("exit policy: TP1 halves sell fraction and cost scale", () => {
       entryPriceUsd: 100,
       tierCfg: cfg,
       auditVerdict: { ok: true, honeypotSafe: true, lpLocked: true, renounced: true },
+      trendSignal: { bearish: false },
       maxHoldMs: null,
     }
   );
 
-  assert.equal(decision?.trigger, "take_profit");
-  assert.equal(decision?.nextStatus, "TP1_HIT");
-  assert.equal(decision?.sellFraction, 0.5);
-  assert.equal(decision?.costBasisScale, 0.5);
+  assert.equal(decision, null);
 });
 
 test("exit policy: time_exit with deadline past", () => {
@@ -154,7 +156,7 @@ test("journal append-only: multiple entries per cycle", () => {
 
 test("exit policy: emergency beats SL at same pnl", () => {
   const cfg = TIER_RISK_CONFIGS.low;
-  // Rug + SL-threshold pnl: emergency should win
+  // Rug delta + SL-threshold pnl: emergency should win
   const decision = evaluateExitPolicy(
     {
       status: "OPEN",
@@ -167,7 +169,8 @@ test("exit policy: emergency beats SL at same pnl", () => {
       currentPriceUsd: 70, // -30% (below SL)
       entryPriceUsd: 100,
       tierCfg: cfg,
-      auditVerdict: { ok: false, honeypotSafe: false, lpLocked: false, renounced: false },
+      auditVerdict: { ok: true, honeypotSafe: true, lpLocked: true, renounced: true },
+      rugSignal: { rugged: true, reason: "liquidity drain" },
       maxHoldMs: null,
     }
   );

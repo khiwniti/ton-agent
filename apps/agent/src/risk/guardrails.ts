@@ -27,31 +27,36 @@ const capTon = (k: string, fb: number) => {
   return Number.isFinite(v) && v > 0 ? v : fb;
 };
 
+const capInt = (k: string, fb: number) => {
+  const v = parseInt(process.env[k] || "", 10);
+  return Number.isFinite(v) && v > 0 ? v : fb;
+};
+
 export const TIER_RISK_CONFIGS: Record<"low" | "mid" | "high", TierRiskConfig> = {
   low: {
     maxPositionTon: capTon("LOW_MAX_POSITION_TON", 1.0),
-    maxOpen: 2,
+    maxOpen: capInt("LOW_MAX_OPEN", 2),
     takeProfitPct: 25,
     stopLossPct: 15,
     minAiScore: 80,
   },
   mid: {
     maxPositionTon: capTon("MID_MAX_POSITION_TON", 3.0),
-    maxOpen: 3,
+    maxOpen: capInt("MID_MAX_OPEN", 3),
     takeProfitPct: 60,
     stopLossPct: 25,
     minAiScore: 65,
   },
   high: {
     maxPositionTon: capTon("HIGH_MAX_POSITION_TON", 5.0),
-    maxOpen: 4,
+    maxOpen: capInt("HIGH_MAX_OPEN", 4),
     takeProfitPct: 150,
     stopLossPct: 40,
     minAiScore: 50,
   },
 };
 
-export const DAILY_LOSS_LIMIT_TON = parseFloat(process.env.DAILY_LOSS_LIMIT_TON || "2.0");
+export const DAILY_LOSS_LIMIT_TON = parseFloat(process.env.DAILY_LOSS_LIMIT_TON || process.env.MAX_DAILY_LOSS_TON || "2.0");
 
 /** Max portfolio allocation per trade (5% of available balance) */
 export const MAX_PORTFOLIO_ALLOCATION_PCT = parseFloat(process.env.MAX_PORTFOLIO_ALLOCATION_PCT || "5");
@@ -138,6 +143,14 @@ export function checkSlippage(
  * Returns true if HIGH tier is unlocked.
  * Unlock criteria: LOW + MID closed >= 5 trades with cumulative PnL > 0.
  */
+export function getTierSlippageCeilingBps(tier: "low" | "mid" | "high"): number {
+  switch (tier) {
+    case "low": return 1000;  // 10%
+    case "mid": return 1500;  // 15%
+    case "high": return 2000; // 20%
+  }
+}
+
 export function isHighTierUnlocked(): boolean {
   try {
     const res = db.prepare(`

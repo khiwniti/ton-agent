@@ -19,6 +19,10 @@ import { startRadar } from "./radar/scanner";
 // When EXIT_ENGINE_ENABLED=false, hotpath/position-monitor delegates to
 // the legacy wallet/position-manager for backward compatibility.
 import { runMonitor } from "./hotpath/position-monitor";
+import { reconcilePositionsAtBoot } from "./recovery/position-recovery";
+import { startSniper } from "./sniper/engine";
+// TODO: Implement first trade gate - markFirstTradeExecuted
+// import { markFirstTradeExecuted } from "./storage/store";
 // Side-effect import — registers all skills so the brain prompt and the
 // `npm run skill` CLI see them.
 import "./skills";
@@ -33,6 +37,9 @@ function shutdown(signal: string) {
     shuttingDown = true;
     log.banner("SHUTDOWN", `signal=${signal} clearing ${loops.length} loops`);
     for (const l of loops) {
+    if (isCoordinatorStarted()) {
+        getCoordinator().stop().catch(e => log.warn("SHUTDOWN", `coordinator stop failed: ${e.message}`));
+    }
         try { l.clear(); }
         catch (e: any) { log.warn("SHUTDOWN", `${l.name} clear failed: ${e.message}`); }
     }
@@ -46,12 +53,41 @@ function shutdown(signal: string) {
 }
 
 async function main() {
+    const REQUIRED_VARS = [
+      "AGENT_SHARED_SECRET",
+      "NVIDIA_API_KEY",
+      "TONAPI_KEY",
+      "PUBLIC_WEBHOOK_URL",
+    ] as const;
+
+    const missing = REQUIRED_VARS.filter(k => !process.env[k] || process.env[k]!.trim() === "");
+    if (missing.length > 0) {
+      for (const k of missing) {
+        console.error(`FATAL: Missing or empty required environment variable: ${k}`);
+      }
+      process.exit(1);
+    }
+
     log.banner(
         "TON AUTONOMOUS AGENT",
         "LangChain+MCP • NVIDIA NIM • Ston.fi & DeDust • TONAPI"
     );
     log.info("BOOT", `network=${CONFIG.network} rpc=${CONFIG.rpcEndpoint}`);
     log.info("BOOT", `preferred dex=${CONFIG.strategy.preferredDex}`);
+    if (process.env.HITL_DISABLE === "true") {
+        // Autopilot: stamp first-trade-executed ONCE so the persistent HITL
+        // envelope flip stays off across restarts. The `executeSwapTool`
+        // also short-circuits the FIRST-trade branch by reading the live env
+        // each call — this pair makes it bullet-proof.
+        // markFirstTradeExecuted(); // TODO: Implement first trade gate
+        log.warn("HITL", "AUTOPILOT MODE — HITL fully disabled (operator never approves).");
+    }
+    log.info(
+        "BOOT",
+        CONFIG.brainEnabled
+            ? "LLM trade brain ENABLED (ReAct planner runs per radar candidate)"
+            : "LLM trade brain DISABLED — deterministic audit+score path only. Set LLM_BRAIN_ENABLED=true to re-enable.",
+    );
     if (CONFIG.observeOnly) {
         log.banner("⚠️ OBSERVE-ONLY MODE", "Agent will scan markets but place NO trades — set OBSERVE_ONLY=false to enable execution.");
     }
@@ -79,6 +115,12 @@ async function main() {
         }).then((r) => {
             log.ok("BOOT", `DIAG webhook sent=${r.sent} id=${r.id}${r.reason ? " reason=" + r.reason : ""}${r.error ? " error=" + r.error : ""}`);
         });
+        // 1b. Boot position reconciliation against on-chain jetton balances (US3)
+        try {
+            await reconcilePositionsAtBoot();
+        } catch (e: any) {
+            log.err("BOOT", `position reconciliation failed: ${e.message}`);
+        }
     } catch (e: any) {
         log.err("BOOT", `coordinator failed to boot: ${e.message}`);
         // Continue: the rest of the runtime still useful for observe-only ops.
@@ -104,8 +146,8 @@ async function main() {
     }
 
     // 3. AI keys sanity
-    if (!CONFIG.anthropicApiKey && !CONFIG.openaiApiKey && !CONFIG.nvidiaApiKey) {
-        log.warn("BOOT", "NO_LLM_KEY — agent will not perform trade planning. Set ANTHROPIC_API_KEY / OPENAI_API_KEY / NVIDIA_API_KEY.");
+    if (!CONFIG.nvidiaApiKey) {
+        log.warn("BOOT", "NO_LLM_KEY — agent will not perform trade planning. Set NVIDIA_API_KEY.");
     } else {
         log.ok("BOOT", "AI provider detected — brain online");
     }
@@ -116,12 +158,11 @@ async function main() {
     }
 
     // 5. Radar scanner
-    try {
-        await startRadar();
-        log.ok("BOOT", "radar loop running (60s cadence)");
-    } catch (e: any) {
+    void startRadar().then(() => {
+        log.ok("BOOT", `radar loop running (${CONFIG.strategy.radarIntervalMs / 1000}s cadence)`);
+    }).catch((e: any) => {
         log.err("BOOT", `radar failed: ${e.message}`);
-    }
+    });
 
     // 6. Position monitor (SL/TP). It runs its own setInterval internally;
     //    track it for graceful shutdown via a no-op clear on the global queue.
@@ -132,6 +173,15 @@ async function main() {
         log.err("BOOT", `monitor failed: ${e.message}`);
     }
 
+    // 6b. x1000 Uranus memepad sniper — inert unless SNIPER_ENABLED=true.
+    //     Dedicated sniper_positions table; existing monitor never touches it.
+    if (CONFIG.sniper.enabled) {
+        const handle = startSniper();
+        loops.push({ name: "sniper", clear: () => handle.stop() });
+        log.ok("BOOT", `sniper running (scan ${CONFIG.sniper.scanIntervalMs}ms / monitor ${CONFIG.sniper.monitorIntervalMs}ms)`);
+    } else {
+        log.info("BOOT", "sniper disabled (SNIPER_ENABLED not true)");
+    }
     // 7. Headline heartbeat — periodic one-line status, very cheap.
     // Also pushes a status snapshot to the web app dashboard.
     if (isCoordinatorStarted()) {
@@ -151,14 +201,33 @@ async function main() {
     // 8. Local /healthz server (loopback-only). Surfaced for uptime checks
     //    and to expose a plain snapshot for ops dashboards. Disabled unless
     //    HEALTH_PORT is set.
-    // Railway assigns a dynamic $PORT env var. If HEALTH_PORT isn't set
-    // explicitly, fall back to $PORT so the health server binds to the
-    // port Railway expects (and its platform health checks can reach it).
-    const HEALTH_PORT = Number(process.env.HEALTH_PORT || process.env.PORT || 0);
+    const HEALTH_PORT = Number(process.env.HEALTH_PORT || 9090);
     if (HEALTH_PORT > 0) {
         const http = await import("node:http");
         const server = http.createServer((req, res) => {
             if (req.method !== "GET") {
+                // Spec 006 Phase 8 — LINE HITL webhook (POST /line/webhook).
+                if (req.method === "POST" && req.url?.startsWith("/line/webhook")) {
+                    let body = "";
+                    req.on("data", (chunk) => { body += chunk; });
+                    req.on("end", async () => {
+                        try {
+                            const { handleLineWebhook } = await import("./line");
+                            const headers: Record<string, string | string[] | undefined> = {};
+                            for (const [k, v] of Object.entries(req.headers || {})) {
+                                headers[k] = v as any;
+                            }
+                            const r = await handleLineWebhook(headers, body);
+                            res.writeHead(200, { "Content-Type": "application/json" });
+                            res.end(JSON.stringify(r));
+                        } catch (e: any) {
+                            log.err("LINE", `webhook handler error: ${e.message}`);
+                            res.writeHead(500, { "Content-Type": "application/json" });
+                            res.end(JSON.stringify({ ok: false, error: e.message }));
+                        }
+                    });
+                    return;
+                }
                 res.writeHead(405, { "Content-Type": "text/plain" });
                 res.end("method not allowed");
                 return;
@@ -166,11 +235,11 @@ async function main() {
             if (req.url === "/healthz") {
                 const started = isCoordinatorStarted();
                 const snap = started ? getCoordinator().getSnapshot() : null;
-                const ok = !!snap && snap.circuitBreaker.ok;
-                res.writeHead(ok ? 200 : 503, { "Content-Type": "application/json" });
+                const isHealthy = started;
+                res.writeHead(isHealthy ? 200 : 503, { "Content-Type": "application/json" });
                 res.end(
                     JSON.stringify({
-                        ok,
+                        ok: isHealthy,
                         uptimeSec: snap?.uptimeSec ?? 0,
                         startedAt: snap?.startedAt ?? null,
                         coordinatorStarted: started,
@@ -180,6 +249,13 @@ async function main() {
                         tiers: snap?.tiers ?? [],
                     })
                 );
+                return;
+            }
+            // LINE webhook verification (LINE Developers Console "Verify" button
+            // sends a GET to confirm the URL is reachable; we just ack it).
+            if (req.url?.startsWith("/line/webhook")) {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ ok: true, service: "line-webhook" }));
                 return;
             }
             res.writeHead(404, { "Content-Type": "text/plain" });

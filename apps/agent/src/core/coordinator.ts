@@ -15,9 +15,10 @@
  * Long-lived process. Booted once from index.ts and shares its lifecycle.
  */
 import axios from "axios";
-import { fromNano, toNano, TonClient } from "@ton/ton";
-import { CONFIG } from "../config";
+import { fromNano, toNano, TonClient, Address } from "@ton/ton";
+import { CONFIG, isTestnet } from "../config";
 import { log } from "../logger";
+import { resolvePool, type PoolResolutionResult } from "../security/pool-resolver";
 import {
   loadKeyPair,
   loadKeyPairForTier,
@@ -25,7 +26,7 @@ import {
   openWallet,
   type KeyPair,
 } from "../wallet/wallet";
-import { executeSwap, type Dex, type SwapRequest, type SwapResult } from "../dex/router";
+import { executeSwap, getSwapQuote, type Dex, type SwapRequest, type SwapResult } from "../dex/router";
 import {
   positionsStore,
   statusStore,
@@ -40,7 +41,9 @@ import {
   TIER_RISK_CONFIGS,
   DAILY_LOSS_LIMIT_TON,
   checkPortfolioAllocation,
+  getTierSlippageCeilingBps,
 } from "../risk/guardrails";
+import { computeMinOut } from "../dex/router";
 import {
   authorizeTicket,
   buildCapContext,
@@ -66,10 +69,24 @@ import {
   type TradeGateInput,
 } from "./gate";
 
+
+import { FastPathSignal, TradingPolicy } from "./policy-types";
+import { policyManager } from "./policy-manager";
+import { fastPathEngine } from "./fastpath-engine";
+import { DirectLiteClient } from "./direct-lite-client";
 // Re-export the pure enum/identifier + gate evaluator with stable names.
 export type Tier = PureTier;
 export { ALL_TIERS, evaluateTradeGate };
 export type { TradeGateInput };
+
+// Market data imports
+import { poolMonitorService } from "../market";
+import { type PoolState } from "../market/data-cache";
+// ML imports
+import { PredictionService } from "../ml/prediction-service";
+import { FeatureEngine } from "../ml/features";
+import { RetrainingScheduler } from "../ml/retraining-scheduler";
+import { ModelTrainer } from "../ml/training";
 
 // Extended TierHandle used by the live coordinator (carries kp/address).
 export interface TierHandle extends PureTierHandle {
@@ -98,36 +115,103 @@ interface CoordinatorState {
   startedAt: number;
   lastPromotionCheck: number;
   highUnlockedSnapshot: boolean;
+    mlServicesInitialized: boolean;
 }
 
 class TierCoordinator {
   private client: TonClient;
   private tiers: Record<Tier, TierHandle> = {} as any;
-  private state: CoordinatorState = {
+  public state: CoordinatorState = {
     killSwitchActive: false,
     killSwitchAutoTripped: false,
     killSwitchMisses: 0,
     startedAt: Date.now(),
     lastPromotionCheck: 0,
     highUnlockedSnapshot: false,
+    mlServicesInitialized: false,
   };
+  public directLiteClient: DirectLiteClient | null = null;
+  public poolMonitor: typeof poolMonitorService = poolMonitorService;
+  public predictionService: PredictionService | null = null;
+  public featureEngine: FeatureEngine | null = null;
+  public retrainingScheduler: RetrainingScheduler | null = null;
 
   constructor(client: TonClient) {
     this.client = client;
+   
+    // Initialize DirectLiteClient for data ingestion if feature flag is enabled
+    if (CONFIG.liteClientEnabled) {
+      this.directLiteClient = new DirectLiteClient(
+        process.env.DIRECT_LITE_ADNL_ENDPOINT || "toncenter.com",
+        process.env.DIRECT_LITE_HTTP_ENDPOINT || "https://toncenter.com/api/v2/jsonRPC",
+        Number(process.env.DIRECT_LITE_TIMEOUT_MS) || 1000,
+        Number(process.env.DIRECT_LITE_MAX_RETRIES) || 3
+      );
+      log.info("COORD", "DirectLiteClient initialized for data ingestion");
+    } else {
+      this.directLiteClient = null;
+    }
+    // Initialize market data services
+    this.initializeMarketData();
+    // Initialize ML services if enabled
+    this.initializeMLServices();
   }
 
+
+  // Initialize market data services
+  private initializeMarketData(): void {
+    this.poolMonitor = poolMonitorService;
+    log.info("COORD", "Market data services initialized");
+  }
+
+  // Initialize ML services
+  private initializeMLServices(): void {
+    if (!CONFIG.mlEnabled) {
+      log.info("COORD", "ML services disabled via configuration");
+      this.state.mlServicesInitialized = false;
+      return;
+    }
+
+    try {
+      this.predictionService = new PredictionService(
+        CONFIG.mlConfidenceThreshold,
+        CONFIG.mlCacheTTLSeconds
+      );
+      this.featureEngine = new FeatureEngine(100); // Keep 100 candles for feature calculation
+      const modelTrainer = new ModelTrainer();
+      this.retrainingScheduler = new RetrainingScheduler(
+        modelTrainer,
+        this.predictionService,
+        CONFIG.mlRetrainingIntervalHours
+      );
+
+      // Start the retraining scheduler
+      this.retrainingScheduler.start();
+
+      log.info("COORD", "ML services initialized successfully");
+      this.state.mlServicesInitialized = true;
+    } catch (error) {
+      log.warn("COORD", `Failed to initialize ML services: ${error instanceof Error ? error.message : String(error)}`);
+      this.predictionService = null;
+      this.featureEngine = null;
+      this.retrainingScheduler = null;
+    this.state.mlServicesInitialized = false;
+    }
+  }
   // ─────────────────────────────────────────────────────────────────
   // 1. INIT — derive keys + wallets for all tiers
   // ─────────────────────────────────────────────────────────────────
   async init(): Promise<void> {
-    log.banner("TIER COORDINATOR", `bootstrap tiers=LOW/MID/HIGH network=${CONFIG.network}`);
+    const enabledTiers = ALL_TIERS.filter((t) => CONFIG.tierEnabled[t]);
+    const disabledTiers = ALL_TIERS.filter((t) => !CONFIG.tierEnabled[t]);
+    log.banner("TIER COORDINATOR", `bootstrap tiers=${enabledTiers.map((t) => t.toUpperCase()).join("/")} disabled=${disabledTiers.map((t) => t.toUpperCase()).join("/") || "none"} network=${CONFIG.network}`);
 
     // HIGH: only enabled if promotion criteria are met, but we always initialize
     // it so a single boot has the wallet hot for prompt promotion.
     const highUnlocked = isHighTierUnlocked();
     this.state.highUnlockedSnapshot = highUnlocked;
 
-    for (const tier of ALL_TIERS) {
+    for (const tier of enabledTiers) {
       try {
         // LOW tier uses the legacy (non-HD) mnemonic path — same as Tonkeeper/MyTonWallet.
         // MID/HIGH use HD derivation with per-tier indices (2, 3) for sub-wallets.
@@ -287,6 +371,9 @@ class TierCoordinator {
       poolTvlTon?: number;
       slippagePct?: number;
       aiScore?: number;
+      /** When true, this swap is an exit sell routed through the coordinator for
+       *  cap-hash auth + minOut enforcement (US2). */
+      isExit?: boolean;
     },
   ): Promise<{
     ok: boolean;
@@ -403,6 +490,9 @@ class TierCoordinator {
     }
 
     if (cap.hitl_required && cap.hitl_status !== "approved") {
+      // Autopilot: when HITL_DISABLE=true this branch is unreachable because
+      // SafetyCaps already short-circuited hitl_required to false. Kept here
+      // as the fail-closed guard for manual-flow (HITL gate kept on).
       const reason = `HITL required (status=${cap.hitl_status}) — not auto-executable`;
       log.warn("COORD", `[${tier.toUpperCase()}] ${reason}`);
       decisionJournalStore.append({
@@ -417,9 +507,30 @@ class TierCoordinator {
       return { ok: false, dex, error: reason, cap, cycle_id: ticket.cycle_id };
     }
 
+    // Route the swap on the DEX where the pool actually lives, not the
+    // caller's preferred DEX. preferredDex defaults to stonfi, but
+    // resolvePool returns DeDust when that's where the liquidity is —
+    // opening a DeDust pool through the Ston.fi v1 router makes
+    // getPoolData throw exit_code -13 and the trade dies with
+    // cannot-enforce-slippage:no-quote. resolvePool is cached (24h) and
+    // fail-soft, so an RPC hiccup here just keeps the caller's dex.
+    let poolResolved: PoolResolutionResult | null = null;
+    try {
+      poolResolved = await resolvePool(this.client, Address.parse(p.jettonMaster));
+    } catch {
+      poolResolved = null;
+    }
+    const execDex: Dex =
+      poolResolved && (poolResolved.source === "stonfi" || poolResolved.source === "dedust")
+        ? poolResolved.source
+        : dex;
+    if (execDex !== dex) {
+      log.info("COORD", `[${tier.toUpperCase()}] reroute: pool on ${poolResolved?.source} — executing via ${execDex} instead of ${dex}`);
+    }
+
     log.trade(
       "COORD",
-      `[${tier.toUpperCase()}] routing ${p.side} ${p.amountTon} TON jett=${p.jettonMaster.slice(0, 8)}… via ${dex} hash=${cap.ticket_hash.slice(0, 8)}`,
+      `[${tier.toUpperCase()}] routing ${p.side} ${p.amountTon} TON jett=${p.jettonMaster.slice(0, 8)}… via ${execDex} hash=${cap.ticket_hash.slice(0, 8)}`,
     );
 
     decisionJournalStore.append({
@@ -428,11 +539,101 @@ class TierCoordinator {
       input_hash: cap.ticket_hash,
       cap_check_result: cap,
       hitl_status: cap.hitl_status,
-      final_action: "execute_submit",
-      output: { dex, side: p.side, amountTon: p.amountTon },
+      final_action: auth?.isExit ? "execute_submit_exit" : "execute_submit",
+      output: { dex: execDex, side: p.side, amountTon: p.amountTon, isExit: auth?.isExit ?? false },
     });
 
-    const res = await executeSwap(this.client, p, tier, dex);
+    // ── Slippage enforcement (US1) ──────────────────────────────
+    // Fetch a live quote, compute minOut from tier ceiling,
+    // and reject if the implied slippage exceeds the tier's ceiling.
+    const ceilingBps = getTierSlippageCeilingBps(tier);
+    if (ceilingBps != null) {
+      const jettonAmountIn = p.side === "buy"
+        ? toNano(p.amountTon.toString()).toString()
+        : p.jettonAmountNano;
+      if (!jettonAmountIn) {
+        log.warn("COORD", `[${tier.toUpperCase()}] cannot compute slippage — no input amount for ${p.side}`);
+      } else {
+        try {
+          if (!poolResolved?.poolAddress) {
+            const reason = "cannot-enforce-slippage:no-pool";
+            log.warn("COORD", `[${tier.toUpperCase()}] ${reason}`);
+            decisionJournalStore.append({
+              cycle_id: ticket.cycle_id,
+              agent: "coordinator",
+              input_hash: cap.ticket_hash,
+              final_action: reason,
+              output: { dex: execDex, side: p.side, amountTon: p.amountTon },
+            });
+            return { ok: false, dex: execDex, error: reason, cap, cycle_id: ticket.cycle_id };
+          }
+          // Buy-side liquidity floor on the FRESH on-chain resolve. The
+          // scanner's scoring gate may have been fed optimistic feed liquidity
+          // (enrichCandidate trusts TONAPI's pool/liquidity when present), so
+          // re-assert the same floor here against the authoritative resolve
+          // BEFORE paying for a quote. A drained pool measures positive TON
+          // depth but quotes zero output — reject it with a clear reason
+          // instead of the misleading cannot-enforce-slippage:no-quote.
+          // Sells must never be blocked by a depth floor (exits need the pool
+          // regardless), mirroring checkPoolMinimum's buy-only gate.
+          if (
+            p.side === "buy" &&
+            poolResolved.liquidityTon !== null &&
+            poolResolved.liquidityTon < CONFIG.strategy.minLiquidityTon
+          ) {
+            const reason = "cannot-enforce-slippage:pool-liquidity-low";
+            log.warn(
+              "COORD",
+              `[${tier.toUpperCase()}] ${reason} liq=${poolResolved.liquidityTon} floor=${CONFIG.strategy.minLiquidityTon} TON`,
+            );
+            decisionJournalStore.append({
+              cycle_id: ticket.cycle_id,
+              agent: "coordinator",
+              input_hash: cap.ticket_hash,
+              final_action: reason,
+              output: { dex: execDex, side: p.side, amountTon: p.amountTon },
+            });
+            return { ok: false, dex: execDex, error: reason, cap, cycle_id: ticket.cycle_id };
+          }
+          const quote = await getSwapQuote(
+            this.client,
+            { dex: execDex, poolAddress: poolResolved.poolAddress },
+            p.side,
+            jettonAmountIn,
+            p.jettonMaster,
+          );
+          if (!quote || !quote.available) {
+            const reason = "cannot-enforce-slippage:no-quote";
+            log.warn("COORD", `[${tier.toUpperCase()}] ${reason}`);
+            decisionJournalStore.append({
+              cycle_id: ticket.cycle_id,
+              agent: "coordinator",
+              input_hash: cap.ticket_hash,
+              final_action: reason,
+              output: { dex: execDex, side: p.side, amountTon: p.amountTon },
+            });
+            return { ok: false, dex: execDex, error: reason, cap, cycle_id: ticket.cycle_id };
+          }
+
+          const minOut = computeMinOut(quote.expectedOutNano, ceilingBps);
+          p.minOutJettonNano = minOut;
+          log.info("COORD", `[${tier.toUpperCase()}] slippage: quote=${quote.expectedOutNano} ceiling=${ceilingBps}bps minOut=${minOut}`);
+        } catch (e: any) {
+          const reason = `cannot-enforce-slippage:quote-error:${e.message ?? "unknown"}`;
+          log.warn("COORD", `[${tier.toUpperCase()}] ${reason}`);
+          decisionJournalStore.append({
+            cycle_id: ticket.cycle_id,
+            agent: "coordinator",
+            input_hash: cap.ticket_hash,
+            final_action: reason,
+            output: { dex: execDex, side: p.side, amountTon: p.amountTon },
+          });
+          return { ok: false, dex: execDex, error: reason, cap, cycle_id: ticket.cycle_id };
+        }
+      }
+    }
+
+    const res = await executeSwap(this.client, p, tier, execDex);
     if (res.ok) {
       await this.refreshBalance(tier);
       decisionJournalStore.append({
@@ -452,6 +653,22 @@ class TierCoordinator {
       });
     }
     return { ...res, cap, cycle_id: ticket.cycle_id };
+  }
+
+  /**
+   * Process a signal via the FastPath engine, bypassing LLM reasoning but enforcing safety checks.
+   * @param signal - The trading signal to process
+   * @param tier - The tier to use for this trade
+   * @returns Result indicating whether it was executed via FastPath
+   */
+  async processFastPathSignal(signal: FastPathSignal, tier: Tier = "low"): Promise<{
+    executedViaFastPath: boolean;
+    swapResult?: import("../dex/router").SwapResult;
+    error?: string;
+    fallbackToColdPath: boolean;
+  }> {
+    // Delegate to the FastPathEngine
+    return fastPathEngine.processSignal(signal, tier);
   }
 
   // ─────────────────────────────────────────────────────────────────
@@ -550,6 +767,26 @@ class TierCoordinator {
     } catch (e: any) {
       log.debug("COORD", `kill-switch unreachable: ${e.message}`);
       this.registerKillSwitchMiss(`kill-switch unreachable: ${e.message}`);
+    }
+  }
+
+  /**
+   * Manually set the kill-switch state (operator override).
+   * Resets auto-trip state and miss counter on manual change.
+   */
+  public setKillSwitch(active: boolean, reason?: string): void {
+    if (active && !this.state.killSwitchActive) {
+      log.warn("COORD", `🛑 KILL-SWITCH MANUALLY ACTIVATED: ${reason ?? "no reason provided"}`);
+      this.state.killSwitchActive = true;
+      this.state.killSwitchReason = reason;
+      this.state.killSwitchAutoTripped = false;
+      this.state.killSwitchMisses = 0;
+    } else if (!active && this.state.killSwitchActive) {
+      log.ok("COORD", "🟢 KILL-SWITCH MANUALLY LIFTED — trading resumed");
+      this.state.killSwitchActive = false;
+      this.state.killSwitchReason = undefined;
+      this.state.killSwitchAutoTripped = false;
+      this.state.killSwitchMisses = 0;
     }
   }
 
@@ -923,8 +1160,21 @@ class TierCoordinator {
       })),
     };
   }
-}
 
+  /**
+   * Stop ML services and cleanup
+   */
+  public async stop(): Promise<void> {
+    try {
+      if (this.retrainingScheduler) {
+        await this.retrainingScheduler.stop();
+        log.info("COORD", "Retraining scheduler stopped");
+      }
+    } catch (error) {
+      log.warn("COORD", `Error stopping ML services: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
 // Singleton-ish coordinator owned by the index.ts boot path.
 let coordinatorInstance: TierCoordinator | null = null;
 let coordinatorStarted = false;

@@ -1,33 +1,48 @@
 /**
  * Pure exit-policy engine — no DB, no network, no LLM.
  *
- * Implements the per-position state machine from spec 002 §8.5:
- *   Monitoring → TakeProfit | StopLoss | Trailing | TimeExit | EmergencyExit → Exited
+ * Implements the per-position exit decision from spec 002 §8.5:
+ *   Monitoring → TrendExit | StopLoss | TimeExit | EmergencyExit → Exited
  *
  * Mirrors the structure of `safetycaps/check.ts`: a single pure function that
  * takes the position + a context of deterministic facts and returns either a
  * decision (when an exit trigger fires) or `null` (continue monitoring).
+ *
+ * ── 2026-08-09 OPERATOR DIRECTIVE ─────────────────────────────────────────
+ * The take-profit ladder (TP1 half-sell → trailing/TP2) and the trailing stop
+ * are GONE. Winners ride the trend with no fixed profit target and close only
+ * when the trend SIGNIFICANTLY flips to downtrend (`trend_exit`, fed by
+ * exit/trend-monitor.ts). The static stop-loss remains the hard loss floor for
+ * the losing side. Rationale: the fixed ladder either banked tiny amounts while
+ * a runner collapsed to the stop (GULYA closed at -80.5% despite a -35% stop on
+ * an illiquid curve), or trapped winners with no protection at all.
  *
  * Hostile-environment rules (spec §6 hot path, §8.5, P6 fail-closed, SC-E):
  *   - No LLM is ever called here. The audit verdict arrives pre-computed in the
  *     context; if it is `null` (price/audit fetch failed), the engine MUST NOT
  *     guess — it skips the emergency trigger and fails closed on the rest.
  *   - Non-finite price/pnl → `null` (no action, never a guess).
- *   - Priority order is fixed (first match wins): emergency → time → SL →
- *     TP1 → trailing/TP2. A rug verdict outranks everything because a rugged
- *     pool may report any price (the price is a lie once liquidity is gone).
+ *   - Priority order is fixed (first match wins): emergency → trend → time →
+ *     stop-loss. A rug verdict outranks everything because a rugged pool may
+ *     report any price (the price is a lie once liquidity is gone).
+ *
+ * 2026-08-08 — the emergency trigger no longer fires on `!auditVerdict.ok`.
+ * That rule closed 26 positions at the DEX spread (~-0.6%) because `ok` demands
+ * `renounced`, a STATIC property the entry gate had already accepted. An exit
+ * gate must never be stricter than the entry gate that admitted the position.
+ * Emergencies now require a measured DELTA (`rugSignal`, see exit/rug-detector.ts):
+ * liquidity drain, or a safety dimension that went good → bad.
  */
 
 import type { TierRiskConfig } from "../risk/guardrails";
+import type { RugSignal } from "./rug-detector";
 
-/** The five exit triggers of the §8.5 state machine. */
+/** The exit triggers of the §8.5 state machine (as of 2026-08-09). */
 export type ExitTrigger =
   | "emergency_exit"
+  | "trend_exit"
   | "time_exit"
-  | "stop_loss"
-  | "take_profit"
-  | "trailing"
-  | "tp2";
+  | "stop_loss";
 
 /**
  * Deterministic audit verdict, re-scored on the hot path via
@@ -35,10 +50,23 @@ export type ExitTrigger =
  * (TONAPI down, parse failed) → fail closed.
  */
 export interface AuditVerdict {
-  /** honeypotSafe && lpLocked && renounced, per `getJetton()`. */
+  /**
+   * honeypotSafe && lpLocked && renounced, per `getJetton()`.
+   *
+   * Retained for observability/journaling ONLY. It is deliberately NOT an exit
+   * trigger: it folds the static `renounced` dimension and undetermined data
+   * gaps into the same `false` as a genuine honeypot.
+   */
   ok: boolean;
   honeypotSafe: boolean;
   lpLocked: boolean;
+  /**
+   * Raw LP tri-state string. Only the exact literal `"unlocked"` is a
+   * degradation; anything else (notably "undetermined") is a data gap, not a
+   * rug. Optional so existing callers/tests that supply only `lpLocked` keep
+   * their original semantics.
+   */
+  lpState?: string;
   renounced: boolean;
 }
 
@@ -54,10 +82,23 @@ export interface ExitPolicyContext {
   /** Per-tier thresholds from `TIER_RISK_CONFIGS[tier]`. */
   tierCfg: TierRiskConfig;
   /**
-   * Re-scored audit verdict, or `null` if unavailable. `ok === false`
-   * triggers EmergencyExit; `null` does NOT (fail closed).
+   * Re-scored audit verdict, or `null` if unavailable. Journaled for
+   * observability; no longer an exit trigger on its own (see `rugSignal`).
    */
   auditVerdict: AuditVerdict | null;
+  /**
+   * Measured rug verdict from `exit/rug-detector.ts` — liquidity drain or a
+   * good → bad transition on a hard safety dimension. This is the ONLY input
+   * that fires EmergencyExit. `null`/not-rugged means keep monitoring.
+   */
+  rugSignal?: RugSignal | null;
+  /**
+   * CONFIRMED significant downtrend flip from `exit/trend-monitor.ts` — the
+   * operator's 2026-08-09 close rule. `bearish: true` fires a full `trend_exit`.
+   * The confirmation filter (consecutive ticks) lives in the tracker, so a
+   * signal present here has already survived the whipsaw check.
+   */
+  trendSignal?: { bearish: boolean; reason?: string } | null;
   /**
    * Per-position time limit in ms (the `max_hold_ms` column).
    * `0`/`null`/`undefined` → TimeExit disabled.
@@ -80,12 +121,12 @@ export interface ExitPolicyPosition {
 /** What the monitor should do when an exit fires. */
 export interface ExitDecision {
   trigger: ExitTrigger;
-  /** Fraction of remaining tokens to sell. 1.0 = full exit, 0.5 = TP1 half. */
+  /** Fraction of remaining tokens to sell. Always 1.0 — no partials remain. */
   sellFraction: number;
   /** DB status to write after the sell lands.
-   * "RUG_EXIT" is a Phase-4 terminal status for emergency exits. */
-  nextStatus: "OPEN" | "TP1_HIT" | "STOPPED" | "CLOSED" | "RUG_EXIT";
-  /** Cost-basis scale applied to the position after a partial sell (TP1 = 0.5). */
+   * "RUG_EXIT" is the terminal status for emergency exits. */
+  nextStatus: "STOPPED" | "CLOSED" | "RUG_EXIT";
+  /** Cost-basis scale applied after the sell (always 1.0 — no partials). */
   costBasisScale: number;
   /** Human-readable reason, journaled verbatim (not trusted for auth). */
   reason: string;
@@ -94,14 +135,14 @@ export interface ExitDecision {
 /**
  * Evaluate the exit state machine. Returns `null` when nothing fires.
  *
- * @param position  the open position (OPEN or TP1_HIT)
+ * @param position  the open position (OPEN or legacy TP1_HIT)
  * @param ctx       deterministic facts for this tick
  */
 export function evaluateExitPolicy(
   position: ExitPolicyPosition,
   ctx: ExitPolicyContext,
 ): ExitDecision | null {
-  const { now, currentPriceUsd, entryPriceUsd, tierCfg, auditVerdict } = ctx;
+  const { now, currentPriceUsd, entryPriceUsd, tierCfg } = ctx;
 
   // ── Fail closed on bad price ───────────────────────────────────────────
   if (!Number.isFinite(currentPriceUsd) || currentPriceUsd <= 0) return null;
@@ -112,20 +153,37 @@ export function evaluateExitPolicy(
 
   const status = position.status;
 
-  // ── 1. EmergencyExit — rug verdict outranks everything ─────────────────
-  // A pool that just rugged may report any price; act on the audit, not pnl.
-  // `auditVerdict === null` means the re-score was unavailable → fail closed.
-  if (auditVerdict !== null && !auditVerdict.ok) {
+  // ── 1. EmergencyExit — measured rug outranks everything ────────────────
+  // A pool that just rugged may report any price; act on the measurement, not
+  // pnl. Only a DELTA counts (see rug-detector): liquidity drain, or a hard
+  // dimension that went good → bad. A static `renounced=false` or an
+  // undetermined dimension is NOT a rug — treating one as such closed 26
+  // positions at the spread for nothing.
+  if (ctx.rugSignal?.rugged) {
     return {
       trigger: "emergency_exit",
       sellFraction: 1.0,
       nextStatus: "RUG_EXIT",
       costBasisScale: 1.0,
-      reason: `emergency exit: audit verdict !ok (honeypot=${auditVerdict.honeypotSafe} lp=${auditVerdict.lpLocked} renounced=${auditVerdict.renounced})`,
+      reason: `emergency exit: ${ctx.rugSignal.reason}`,
     };
   }
 
-  // ── 2. TimeExit — hard deadline, OPEN only ─────────────────────────────
+  // ── 2. TrendExit — significant downtrend flip, any open status ─────────
+  // Operator directive 2026-08-09: no TP/trailing targets. Winners ride the
+  // trend; a CONFIRMED downtrend flip is the close signal (the consecutive-tick
+  // whipsaw filter ran in exit/trend-monitor.ts before this was set).
+  if (ctx.trendSignal?.bearish) {
+    return {
+      trigger: "trend_exit",
+      sellFraction: 1.0,
+      nextStatus: "CLOSED",
+      costBasisScale: 1.0,
+      reason: `trend exit: ${ctx.trendSignal.reason ?? "significant downtrend flip"}`,
+    };
+  }
+
+  // ── 3. TimeExit — hard deadline, OPEN only ─────────────────────────────
   const maxHoldMs = ctx.maxHoldMs ?? 0;
   if (status === "OPEN" && maxHoldMs > 0 && position.exit_by_ms != null) {
     if (now >= position.exit_by_ms) {
@@ -139,8 +197,10 @@ export function evaluateExitPolicy(
     }
   }
 
-  // ── 3. StopLoss — OPEN only ─────────────────────────────────────────────
-  if (status === "OPEN" && pnl <= -tierCfg.stopLossPct) {
+  // ── 4. StopLoss — the hard loss floor, any open status ─────────────────
+  // Not OPEN-only: a legacy TP1_HIT runner must not be allowed to sink past
+  // the floor either. Every exit here is a full close.
+  if (pnl <= -tierCfg.stopLossPct) {
     return {
       trigger: "stop_loss",
       sellFraction: 1.0,
@@ -148,40 +208,6 @@ export function evaluateExitPolicy(
       costBasisScale: 1.0,
       reason: `stop loss: pnl=${pnl.toFixed(2)}% <= -${tierCfg.stopLossPct}%`,
     };
-  }
-
-  // ── 4. TakeProfit1 — OPEN only, sells half ────────────────────────────
-  if (status === "OPEN" && pnl >= tierCfg.takeProfitPct) {
-    return {
-      trigger: "take_profit",
-      sellFraction: 0.5,
-      nextStatus: "TP1_HIT",
-      costBasisScale: 0.5,
-      reason: `take-profit 1: pnl=${pnl.toFixed(2)}% >= ${tierCfg.takeProfitPct}%`,
-    };
-  }
-
-  // ── 5. Trailing / TP2 — TP1_HIT only ───────────────────────────────────
-  // Trail to entry once pnl gives back to ≤0; or take the second target at 2×.
-  if (status === "TP1_HIT") {
-    if (pnl <= 0) {
-      return {
-        trigger: "trailing",
-        sellFraction: 1.0,
-        nextStatus: "CLOSED",
-        costBasisScale: 1.0,
-        reason: `trailing stop: pnl=${pnl.toFixed(2)}% <= 0 (trail to entry)`,
-      };
-    }
-    if (pnl >= tierCfg.takeProfitPct * 2) {
-      return {
-        trigger: "tp2",
-        sellFraction: 1.0,
-        nextStatus: "CLOSED",
-        costBasisScale: 1.0,
-        reason: `tp2: pnl=${pnl.toFixed(2)}% >= ${tierCfg.takeProfitPct * 2}%`,
-      };
-    }
   }
 
   return null;

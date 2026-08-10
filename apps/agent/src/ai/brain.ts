@@ -20,10 +20,10 @@
  * specialist — it builds a written plan BEFORE touching anything.
  */
 import { ChatOpenAI } from "@langchain/openai";
-import { ChatAnthropic } from "@langchain/anthropic";
 import { HumanMessage, type BaseMessage } from "@langchain/core/messages";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
-import { TavilySearch } from "@langchain/tavily";
+import { ExaSearchResults } from "@langchain/exa";
+import Exa from "exa-js";
 import { newId, type AgentMessage } from "@ton-agent/shared";
 import { CONFIG } from "../config";
 import { log } from "../logger";
@@ -38,31 +38,24 @@ import {
     notifyWebTool,
     checkRiskStatusTool,
     recordPositionTool,
+    localSlmReasoningTool,
 } from "../mcp/tools";
 // Side-effect import: registers all skills + exposes availableSkillsSection().
 import { availableSkillsSection } from "../skills";
 
+// Explicitly clear any inherited LangSmith tracing flags so the @langchain
+// stack cannot accidentally re-engage a parent-process tracer.
+delete process.env.LANGCHAIN_TRACING_V2;
+delete process.env.LANGCHAIN_API_KEY;
+delete process.env.LANGCHAIN_ENDPOINT;
+delete process.env.LANGCHAIN_PROJECT;
+
 // ───────────────────────────────────────────────────────────────────
-// Model selection — pick the strongest bootable.
+// Model selection — NVIDIA NIM (nemotron-3-ultra-550b) as primary.
 // ───────────────────────────────────────────────────────────────────
 function pickModel() {
-    if (CONFIG.anthropicApiKey) {
-        // Claude-3.5-Sonnet is best-in-class for finance reasoning.
-        return new ChatAnthropic({
-            apiKey: CONFIG.anthropicApiKey,
-            model: "claude-3-5-sonnet-20241022",
-            temperature: 0.2,
-        });
-    }
-    if (CONFIG.openaiApiKey) {
-        return new ChatOpenAI({
-            apiKey: CONFIG.openaiApiKey,
-            model: "gpt-4o-2024-11-20",
-            temperature: 0.2,
-        });
-    }
     if (CONFIG.nvidiaApiKey) {
-        // NVIDIA NIM offers OpenAI-compatible endpoint.
+        // NVIDIA NIM offers OpenAI-compatible endpoint with Nemotron-3-Ultra.
         return new ChatOpenAI({
             apiKey: CONFIG.nvidiaApiKey,
             model: CONFIG.nvidiaModel,
@@ -70,7 +63,7 @@ function pickModel() {
             configuration: { baseURL: "https://integrate.api.nvidia.com/v1" },
         });
     }
-    throw new Error("NO_LLM_KEY — set ANTHROPIC_API_KEY, OPENAI_API_KEY, or NVIDIA_API_KEY.");
+    throw new Error("NO_LLM_KEY — set NVIDIA_API_KEY.");
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -91,7 +84,7 @@ Expert 2 — Risk & Execution.
   Mission: enforce size caps (default tier='low'), respect the kill-switch + circuit breaker, ensure HIGH tier is unlocked before considering it, and post-buy persistence for the position monitor. This expert NEVER executes without an Expert 1 PASS.
 
 Expert 3 — Market Intelligence.
-  Tools at your disposal: tavily_search (research), watch_position, notify_web.
+  Tools at your disposal: exa_search (research), watch_position, notify_web.
   Mission: gather news, narrative, sentiment, and live price ticks. Surface the "why now" and the "exit signal." Also owns outbound human-readable notifications.
 
 The Chief will:
@@ -112,6 +105,23 @@ The Chief will:
 9. ALWAYS call record_position immediately after a successful BUY so the position monitor can apply stops and take-profits. If the swap succeeded but the router returns no jetton amount, emit verdict="UNRECORDED" + loud warning — do NOT record a zero-amount row.
 10. ALWAYS reason with "because…" statements referencing real data (audit result, balance, price).
 
+== AUTOPILOT EXECUTION BIAS (operator wants speed-to-profit) ==
+In autopilot mode (HITL_DISABLE=true on Fly), the operator has explicitly
+opted out of approving individual trades — the brain IS the decision.
+- When audit_jetton returns ok=true AND the pool has any resolved liquidity:
+  lean BUY with the smallest defensive size that still fires (do NOT pick a
+  size of 0; a no-op trade is the worst outcome when the operator is
+  unavailable).
+- If the scoring engine gives you >= 30 on total and the audit is clean:
+  treat that as a BUY signal — choose size respecting the tier's
+  maxPositionTon AND the 5% portfolio allocation cap (use the smaller of the
+  two). SELL path is the position monitor's job, not yours.
+- Skip ONLY for hard reasons: audit_failed, honeypot_detected, or
+  pool=undetermined AND no auto-fallback. Soft concerns (low holders,
+  thin TVL, age<24h) are NOT skip reasons — the audit already vetted them.
+- Cap each trade low (default tier size) by default; do not average up.
+- Always record_position immediately after execute_swap success.
+
 == COMPOSABLE SKILLS ==
 The agent ships with skill packs that compose Expert 1 → 2 → 3 into one call:
 
@@ -131,13 +141,12 @@ End every run with a 3-line summary: PLAN, EXECUTED_OR_SKIPPED, NEXT_MONITORING_
 // Tools bundle
 // ───────────────────────────────────────────────────────────────────
 const researchTools: any[] = [];
-if (CONFIG.tavilyApiKey) {
-    // @langchain/tavily v0.1+ field is `tavilyApiKey` (camelCase), not `apiKey`.
-    // Falls back to TAVILY_API_KEY env if the param is omitted. We cast `as any`
-    // because the installed .d.ts uses TavilySearchAPIRetrieverFields which only
-    // declares `apiWrapper`/`apiBaseUrl` — the underlying TavilySearch class
-    // accepts the camelCase form at runtime.
-    researchTools.push(new TavilySearch({ maxResults: 5, tavilyApiKey: CONFIG.tavilyApiKey } as any));
+if (CONFIG.exaApiKey) {
+    const exaClient = new Exa(CONFIG.exaApiKey);
+    researchTools.push(new ExaSearchResults({
+        client: exaClient,
+        searchArgs: { numResults: 5 },
+    }));
 }
 
 const tools = [
@@ -150,6 +159,7 @@ const tools = [
     notifyWebTool,
     checkRiskStatusTool,
     recordPositionTool,
+    localSlmReasoningTool,
     ...researchTools,
 ];
 
@@ -180,7 +190,9 @@ export async function runTradeBrain(input: string, opts: { pushToWeb?: boolean; 
         {
             streamMode: "values",
             recursionLimit: 24, // message-iteration cap to bound API spend
-            configurable: { thread_id: threadId },
+            configurable: {
+                thread_id: threadId,
+            },
         }
     );
 

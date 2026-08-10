@@ -14,39 +14,6 @@ log.info("STORE", `Initializing SQLite DB at ${dbPath}`);
 export const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
 
-// Migrate: add confidence_score column to positions table in existing databases.
-// CREATE TABLE IF NOT EXISTS only applies to new tables; existing ones skip it.
-try {
-  db.exec("ALTER TABLE positions ADD COLUMN confidence_score INTEGER NOT NULL DEFAULT 0");
-  log.info("STORE", "migrated positions table — added confidence_score column");
-} catch {
-  // Column already exists — safe to ignore.
-}
-
-// Phase 4: hot-path exit-policy state. Inline try/catch ALTER matches the
-// confidence_score pattern; safe on fresh DBs (columns absent→added) and
-// existing ones (present→no-op). No backfill needed: defaults are inert.
-//   max_hold_ms    — per-position time-limit; 0/NULL = no TimeExit (spec §8.5)
-//   exit_by_ms     — computed deadline = entry_at + max_hold_ms (denormalised for fast tick checks)
-//   rugged         — 1 once emergency-exit fired on audit `reject`; COALESCE-guarded so it never resets
-//   rugged_at      — detection timestamp
-//   emergency_exit — 1 once an emergency exit was executed for this position
-const PHASE4_COLUMNS: Array<[string, string]> = [
-  ["max_hold_ms", "INTEGER"],
-  ["exit_by_ms", "INTEGER"],
-  ["rugged", "INTEGER NOT NULL DEFAULT 0"],
-  ["rugged_at", "INTEGER"],
-  ["emergency_exit", "INTEGER NOT NULL DEFAULT 0"],
-];
-for (const [col, type] of PHASE4_COLUMNS) {
-  try {
-    db.exec(`ALTER TABLE positions ADD COLUMN ${col} ${type}`);
-    log.info("STORE", `migrated positions table — added ${col} column`);
-  } catch {
-    // Column already exists — safe to ignore.
-  }
-}
-
 // Initialize tables
 db.exec(`
   CREATE TABLE IF NOT EXISTS positions (
@@ -68,7 +35,28 @@ db.exec(`
     status TEXT NOT NULL,
     take_profit_t1_tx TEXT,
     close_tx TEXT,
-    close_at INTEGER
+    close_at INTEGER,
+    -- Phase 4 hot-path exit-policy state. Declared HERE (not only as an
+    -- ALTER migration) so a fresh DB has them from the start: the migration
+    -- below cannot create them before this statement runs.
+    max_hold_ms INTEGER,
+    exit_by_ms INTEGER,
+    rugged INTEGER NOT NULL DEFAULT 0,
+    rugged_at INTEGER,
+    emergency_exit INTEGER NOT NULL DEFAULT 0,
+    -- Cumulative TON burned on gas for this position (entry + exit legs).
+    -- Added 2026-08-08: realized_pnl_ton previously omitted gas entirely, so
+    -- the books reported -0.188 TON while the wallet drained to 0.000000.
+    gas_ton REAL NOT NULL DEFAULT 0,
+    -- Live-monitor trend state (written every tick while OPEN). Declared HERE
+    -- so a fresh DB has them from the start; POSITION_MIGRATIONS covers
+    -- existing databases.
+    trend_bearish INTEGER NOT NULL DEFAULT 0,
+    trend_confirmations INTEGER NOT NULL DEFAULT 0,
+    trend_observations INTEGER NOT NULL DEFAULT 0,
+    trend_reason TEXT,
+    trend_updated_at INTEGER,
+    feed_confirmed INTEGER NOT NULL DEFAULT 0
   );
 
   CREATE TABLE IF NOT EXISTS seen_jettons (
@@ -159,7 +147,47 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_decision_journal_cycle
     ON decision_journal(cycle_id, ts);
+
+  CREATE TABLE IF NOT EXISTS agent_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `);
+
+/**
+ * Column migrations for databases created before a column was added to the
+ * CREATE TABLE above. MUST run after it — an ALTER on a table that does not
+ * exist yet fails, and on a fresh DB that failure used to be swallowed,
+ * leaving the table without the Phase-4 columns and making every
+ * positionsStore.upsert throw `no such column: excluded.max_hold_ms`.
+ *
+ * Only "duplicate column name" is expected (column already present). Anything
+ * else is a real schema fault and must surface rather than be absorbed.
+ */
+const POSITION_MIGRATIONS: Array<[string, string]> = [
+  ["confidence_score", "INTEGER NOT NULL DEFAULT 0"],
+  ["max_hold_ms", "INTEGER"],
+  ["exit_by_ms", "INTEGER"],
+  ["rugged", "INTEGER NOT NULL DEFAULT 0"],
+  ["rugged_at", "INTEGER"],
+  ["emergency_exit", "INTEGER NOT NULL DEFAULT 0"],
+  ["gas_ton", "REAL NOT NULL DEFAULT 0"],
+  ["trend_bearish", "INTEGER NOT NULL DEFAULT 0"],
+  ["trend_confirmations", "INTEGER NOT NULL DEFAULT 0"],
+  ["trend_observations", "INTEGER NOT NULL DEFAULT 0"],
+  ["trend_reason", "TEXT"],
+  ["trend_updated_at", "INTEGER"],
+  ["feed_confirmed", "INTEGER NOT NULL DEFAULT 0"],
+];
+for (const [col, type] of POSITION_MIGRATIONS) {
+  try {
+    db.exec(`ALTER TABLE positions ADD COLUMN ${col} ${type}`);
+    log.info("STORE", `migrated positions table — added ${col} column`);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/duplicate column name/i.test(msg)) throw e;
+  }
+}
 
 // Helper types matching shared schema
 export interface DbPosition {
@@ -188,27 +216,83 @@ export interface DbPosition {
   rugged?: number;                    // 1 once emergency-exit fired (never reset)
   rugged_at?: number | null;
   emergency_exit?: number;            // 1 once an emergency exit was executed
+  /** Cumulative gas (TON) charged against this position. Already deducted
+   *  from realized_pnl_ton — kept separately so gas can be audited and the
+   *  ENTRY_GAS_TON/EXIT_GAS_TON estimates calibrated against reality. */
+  gas_ton?: number;
+  // Live-monitor trend state (written every tick while OPEN)
+  trend_bearish?: number; // 1 once the trend engine reports bearish
+  trend_confirmations?: number; // consecutive bearish observations seen
+  trend_observations?: number; // real (non-seed) observations seen
+  trend_reason?: string | null;
+  trend_updated_at?: number | null;
+  feed_confirmed?: number; // 1 = external feeds corroborated the flip
 }
 
 // Positions API
 export const positionsStore = {
+  /**
+   * Insert or update a position.
+   *
+   * Every optional field of `DbPosition` is defaulted before binding. SQLite
+   * named parameters are all-or-nothing: a key absent from the object throws
+   * `Missing named parameter "..."` at run time, not compile time, so a caller
+   * passing a partial row (several do, via `as any`) would fail mid-trade —
+   * after the swap has already settled on chain.
+   */
   upsert(p: DbPosition) {
+    const row = {
+      symbol: null,
+      dex: null,
+      entry_price_usd: null,
+      confidence_score: null,
+      current_price_ton: null,
+      pnl_pct: null,
+      realized_pnl_ton: null,
+      take_profit_t1_tx: null,
+      close_tx: null,
+      close_at: null,
+      max_hold_ms: null,
+      exit_by_ms: null,
+      rugged: null,
+      rugged_at: null,
+      emergency_exit: null,
+      // Sticky columns: omitted fields must bind NULL so the UPDATE-side
+      // COALESCE preserves the stored value (gas accumulates across partial
+      // closes; rugged/emergency_exit stay set once flipped). A `0` default
+      // here would silently reset them on every tick update.
+      gas_ton: null,
+      trend_bearish: 0,
+      trend_confirmations: 0,
+      trend_observations: 0,
+      trend_reason: null,
+      trend_updated_at: null,
+      feed_confirmed: 0,
+      ...p,
+    };
     const    stmt = db.prepare(`
       INSERT INTO positions (
         id, wallet_tier, jetton_master, symbol, dex, entry_tx_hash,
         entry_price_ton, entry_price_usd, entry_at, amount_tokens, cost_basis_ton,
         confidence_score,
-        current_price_ton, pnl_pct, realized_pnl_ton, status, take_profit_t1_tx, close_tx, close_at
+        current_price_ton, pnl_pct, realized_pnl_ton, status, take_profit_t1_tx, close_tx, close_at,
+        -- Phase 4 columns were in the UPDATE clause but NOT here, so a new
+        -- position's time limit was dropped on INSERT: max_hold_ms/exit_by_ms
+        -- landed NULL and the TimeExit rule never fired for it.
+        max_hold_ms, exit_by_ms, rugged, rugged_at, emergency_exit, gas_ton,
+        trend_bearish, trend_confirmations, trend_observations, trend_reason, trend_updated_at, feed_confirmed
       ) VALUES (
         @id, @wallet_tier, @jetton_master, @symbol, @dex, @entry_tx_hash,
         @entry_price_ton, @entry_price_usd, @entry_at, @amount_tokens, @cost_basis_ton,
         COALESCE(@confidence_score, 0),
-        @current_price_ton, @pnl_pct, @realized_pnl_ton, @status, @take_profit_t1_tx, @close_tx, @close_at
+        @current_price_ton, @pnl_pct, @realized_pnl_ton, @status, @take_profit_t1_tx, @close_tx, @close_at,
+        @max_hold_ms, @exit_by_ms, COALESCE(@rugged, 0), @rugged_at, COALESCE(@emergency_exit, 0), COALESCE(@gas_ton, 0),
+        @trend_bearish, @trend_confirmations, @trend_observations, @trend_reason, @trend_updated_at, @feed_confirmed
       ) ON CONFLICT(id) DO UPDATE SET
         wallet_tier=excluded.wallet_tier,
         symbol=COALESCE(excluded.symbol, symbol),
         dex=COALESCE(excluded.dex, dex),
-        confidence_score=COALESCE(excluded.confidence_score, confidence_score),
+        confidence_score=COALESCE(@confidence_score, confidence_score),
         current_price_ton=excluded.current_price_ton,
         pnl_pct=excluded.pnl_pct,
         realized_pnl_ton=excluded.realized_pnl_ton,
@@ -218,14 +302,25 @@ export const positionsStore = {
         close_at=COALESCE(excluded.close_at, close_at),
         -- Phase 4 exit state. max_hold_ms/exit_by_ms set on entry only; the
         -- tick just updates price/pnl/status and at exit flips rugged flags.
-        -- COALESCE keeps rugged/rugged_at/emergency_exit sticky (once set, stays set).
+        -- Sticky columns reference the raw @param, NOT excluded.*: excluded
+        -- holds the post-COALESCE insert value (0 when omitted), which would
+        -- overwrite the stored value. @param is NULL when omitted, so
+        -- COALESCE(@x, col) keeps the stored value (once set, stays set).
         max_hold_ms=COALESCE(excluded.max_hold_ms, max_hold_ms),
         exit_by_ms=COALESCE(excluded.exit_by_ms, exit_by_ms),
-        rugged=COALESCE(excluded.rugged, rugged),
+        rugged=COALESCE(@rugged, rugged),
         rugged_at=COALESCE(excluded.rugged_at, rugged_at),
-        emergency_exit=COALESCE(excluded.emergency_exit, emergency_exit)
+        emergency_exit=COALESCE(@emergency_exit, emergency_exit),
+        gas_ton=COALESCE(@gas_ton, gas_ton),
+        -- Trend state overwritten every tick like price/pnl (NOT sticky).
+        trend_bearish=excluded.trend_bearish,
+        trend_confirmations=excluded.trend_confirmations,
+        trend_observations=excluded.trend_observations,
+        trend_reason=excluded.trend_reason,
+        trend_updated_at=excluded.trend_updated_at,
+        feed_confirmed=excluded.feed_confirmed
     `);
-    stmt.run(p);
+    stmt.run(row);
   },
 
   listOpen(): DbPosition[] {
@@ -243,6 +338,14 @@ export const positionsStore = {
   countClosedForTier(tier: string): number {
     const res = db.prepare("SELECT COUNT(*) as count FROM positions WHERE status IN ('CLOSED', 'STOPPED') AND wallet_tier = ?").get(tier) as any;
     return res?.count || 0;
+  },
+
+  /** True if this jetton ever had a terminal exit (RUG_EXIT / STOPPED). */
+  hasTerminalExit(jettonMaster: string): boolean {
+    const res = db
+      .prepare("SELECT 1 FROM positions WHERE jetton_master = ? AND status IN ('RUG_EXIT', 'STOPPED') LIMIT 1")
+      .get(jettonMaster) as any;
+    return !!res;
   },
 
   countPositiveClosedForTier(tier: string): number {
@@ -567,5 +670,174 @@ export const decisionJournalStore = {
       .prepare("SELECT COUNT(*) as c FROM decision_journal")
       .get() as { c: number };
     return row?.c ?? 0;
+  },
+};
+
+// ─────────────────────────────────────────────────────────────────────
+// First-trade HITL gate — persisted in agent_settings so a restart after
+// the first trade does not re-arm the human approval requirement.
+// ─────────────────────────────────────────────────────────────────────
+const getSetting = db.prepare("SELECT value FROM agent_settings WHERE key = ?");
+const setSetting = db.prepare(`
+  INSERT INTO agent_settings (key, value) VALUES (?, ?)
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value
+`);
+const deleteSetting = db.prepare("DELETE FROM agent_settings WHERE key = ?");
+
+const FIRST_TRADE_KEY = "first_trade_executed";
+
+export function isFirstTradeExecuted(): boolean {
+  const row = getSetting.get(FIRST_TRADE_KEY) as { value: string } | undefined;
+  return row?.value === "1";
+}
+
+export function markFirstTradeExecuted(): void {
+  setSetting.run(FIRST_TRADE_KEY, "1");
+}
+
+/** Test/ops escape hatch — clears the flag so the gate re-arms. */
+export function resetFirstTradeGate(): void {
+  deleteSetting.run(FIRST_TRADE_KEY);
+}
+
+
+// ─────────────────────────────────────────────────────────────────────
+// x1000 sniper (spec: sniper-x1000) — dedicated position table.
+//
+// Deliberately SEPARATE from `positions`: the sniper manages its own
+// lifecycle (curve buys via DeDust v4 router, sells via the memepad) and
+// must NOT be picked up by the existing exit-engine/position-manager
+// loops, which target stonfi/dedust pool positions with a different
+// lifecycle. Sniper decisions still flow into decision_journal (shared,
+// append-only) for post-mortems.
+// ─────────────────────────────────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sniper_positions (
+    id TEXT PRIMARY KEY,
+    asset TEXT NOT NULL,
+    master TEXT NOT NULL,
+    symbol TEXT,
+    status TEXT NOT NULL DEFAULT 'OPEN',
+    entry_tx_hash TEXT,
+    entry_at INTEGER NOT NULL,
+    spent_ton_nano TEXT NOT NULL,
+    amount_tokens_nano TEXT NOT NULL,
+    entry_price_ton REAL NOT NULL,
+    peak_price_ton REAL NOT NULL,
+    current_price_ton REAL,
+    pnl_pct REAL,
+    tp1_hit INTEGER NOT NULL DEFAULT 0,
+    tp1_tx_hash TEXT,
+    close_tx_hash TEXT,
+    close_reason TEXT,
+    close_at INTEGER,
+    migrated INTEGER NOT NULL DEFAULT 0,
+    curve_pct_at_entry REAL,
+    notes TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS sniper_daily (
+    day TEXT PRIMARY KEY,
+    spent_ton_nano TEXT NOT NULL DEFAULT '0',
+    realized_ton_nano TEXT NOT NULL DEFAULT '0'
+  );
+`);
+
+export interface DbSniperPosition {
+  id: string;
+  asset: string;
+  master: string;
+  symbol: string | null;
+  status: "OPEN" | "CLOSED" | "STOPPED" | "REJECTED";
+  entry_tx_hash: string | null;
+  entry_at: number;
+  spent_ton_nano: string;
+  amount_tokens_nano: string;
+  entry_price_ton: number;
+  peak_price_ton: number;
+  current_price_ton: number | null;
+  pnl_pct: number | null;
+  tp1_hit: number;
+  tp1_tx_hash: string | null;
+  close_tx_hash: string | null;
+  close_reason: string | null;
+  close_at: number | null;
+  migrated: number;
+  curve_pct_at_entry: number | null;
+  notes: string | null;
+}
+
+export const sniperPositionStore = {
+  upsert(p: Partial<DbSniperPosition> & { id: string }) {
+    db.prepare(`
+      INSERT INTO sniper_positions (
+        id, asset, master, symbol, status, entry_tx_hash, entry_at,
+        spent_ton_nano, amount_tokens_nano, entry_price_ton, peak_price_ton,
+        current_price_ton, pnl_pct, tp1_hit, tp1_tx_hash, close_tx_hash,
+        close_reason, close_at, migrated, curve_pct_at_entry, notes
+      ) VALUES (
+        @id, @asset, @master, @symbol, @status, @entry_tx_hash, @entry_at,
+        @spent_ton_nano, @amount_tokens_nano, @entry_price_ton, @peak_price_ton,
+        @current_price_ton, @pnl_pct, @tp1_hit, @tp1_tx_hash, @close_tx_hash,
+        @close_reason, @close_at, @migrated, @curve_pct_at_entry, @notes
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        symbol=COALESCE(excluded.symbol, symbol),
+        status=excluded.status,
+        entry_tx_hash=COALESCE(excluded.entry_tx_hash, entry_tx_hash),
+        spent_ton_nano=excluded.spent_ton_nano,
+        amount_tokens_nano=excluded.amount_tokens_nano,
+        entry_price_ton=excluded.entry_price_ton,
+        peak_price_ton=excluded.peak_price_ton,
+        current_price_ton=excluded.current_price_ton,
+        pnl_pct=excluded.pnl_pct,
+        tp1_hit=excluded.tp1_hit,
+        tp1_tx_hash=COALESCE(excluded.tp1_tx_hash, tp1_tx_hash),
+        close_tx_hash=COALESCE(excluded.close_tx_hash, close_tx_hash),
+        close_reason=COALESCE(excluded.close_reason, close_reason),
+        close_at=COALESCE(excluded.close_at, close_at),
+        migrated=excluded.migrated,
+        curve_pct_at_entry=COALESCE(excluded.curve_pct_at_entry, curve_pct_at_entry),
+        notes=excluded.notes
+    `).run(p);
+  },
+
+  listOpen(): DbSniperPosition[] {
+    return db
+      .prepare("SELECT * FROM sniper_positions WHERE status = 'OPEN' ORDER BY entry_at ASC")
+      .all() as DbSniperPosition[];
+  },
+
+  get(id: string): DbSniperPosition | undefined {
+    return db.prepare("SELECT * FROM sniper_positions WHERE id = ?").get(id) as DbSniperPosition | undefined;
+  },
+
+  /** Total realized PnL (nanoTON) for the day — circuit breaker input. */
+  realizedToday(day: string): bigint {
+    const row = db
+      .prepare("SELECT realized_ton_nano FROM sniper_daily WHERE day = ?")
+      .get(day) as { realized_ton_nano: string } | undefined;
+    return BigInt(row?.realized_ton_nano ?? "0");
+  },
+
+  spentToday(day: string): bigint {
+    const row = db
+      .prepare("SELECT spent_ton_nano FROM sniper_daily WHERE day = ?")
+      .get(day) as { spent_ton_nano: string } | undefined;
+    return BigInt(row?.spent_ton_nano ?? "0");
+  },
+
+  addSpent(day: string, nano: bigint) {
+    db.prepare(`
+      INSERT INTO sniper_daily (day, spent_ton_nano) VALUES (?, ?)
+      ON CONFLICT(day) DO UPDATE SET spent_ton_nano = CAST(spent_ton_nano AS INTEGER) + ?
+    `).run(day, nano.toString(), nano.toString());
+  },
+
+  addRealized(day: string, nano: bigint) {
+    db.prepare(`
+      INSERT INTO sniper_daily (day, realized_ton_nano) VALUES (?, ?)
+      ON CONFLICT(day) DO UPDATE SET realized_ton_nano = CAST(realized_ton_nano AS INTEGER) + ?
+    `).run(day, nano.toString(), nano.toString());
   },
 };
