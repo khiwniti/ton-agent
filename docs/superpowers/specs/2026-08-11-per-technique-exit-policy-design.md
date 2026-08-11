@@ -460,9 +460,26 @@ should stay set until workstream 0 closes.
    tuned. This outranks every question below.
 1. **Unresolved: the chain's actual text.** §2 was designed without it. Paste or
    export it and re-verify.
-2. **Deployed config vs. repo defaults diverge.** `time_exit` fired 25,938 times
-   in production while the checked-out default is `0` (disabled). Reconcile
-   before trusting any parameter claim in this document.
+2. **Deployed config vs. repo defaults diverge — now diagnosed.** Runtime env
+   read from `ton-agent-runtime` on 2026-08-11 shows `LOW_MAX_HOLD_MS=3600000`
+   (1 hour) against a repo default of `0`. This is the source of the 25,938
+   `time_exit` events. **§2.1's claim that SWING has no time-stop describes the
+   repo, not production.** Decide which is correct and align them.
+3. **Duplicate daily-loss keys, different values.** Both
+   `DAILY_LOSS_LIMIT_TON=10.0` and `MAX_DAILY_LOSS_TON=8` are deployed. Per the
+   2026-08-09 incident the code reads `DAILY_LOSS_LIMIT_TON`; the other name was
+   the original secret. Adding the correct key without removing the wrong one
+   leaves an ambiguity rather than a fix — the circuit breaker's true threshold
+   is not readable from the config. Collapse to one key.
+4. **§4.0a's 108% gas ratio may describe a retired configuration.** Production
+   runs `SNIPER_PER_TRADE_TON=1.62`, but the 125 historical positions average
+   ~0.065 TON spend (8.10 TON total). The 108% aggregate came from those much
+   smaller positions. **0a must compute the gas ratio per trade from
+   `trade_transactions.gas_fees / input_amount`, not from the aggregate**, and
+   segment by date — the current sizing may already have resolved it.
+5. **`SNIPER_ENABLED=true` and `SNIPER_DRY_RUN=false`; only `OBSERVE_ONLY=true`
+   prevents live trading.** The sniper is armed behind a single flag. Confirm
+   that is the intended safety posture while workstream 0 is open.
 2. Does the verified noClose figure still justify the time-stop, or does it
    collapse toward the dataset edge?
 3. Should the `excess` input in `effectiveStopPct` be bounded, or the curve
