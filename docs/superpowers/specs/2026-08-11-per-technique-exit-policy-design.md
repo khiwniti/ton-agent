@@ -465,12 +465,20 @@ should stay set until workstream 0 closes.
    (1 hour) against a repo default of `0`. This is the source of the 25,938
    `time_exit` events. **§2.1's claim that SWING has no time-stop describes the
    repo, not production.** Decide which is correct and align them.
-3. **Duplicate daily-loss keys, different values.** Both
-   `DAILY_LOSS_LIMIT_TON=10.0` and `MAX_DAILY_LOSS_TON=8` are deployed. Per the
-   2026-08-09 incident the code reads `DAILY_LOSS_LIMIT_TON`; the other name was
-   the original secret. Adding the correct key without removing the wrong one
-   leaves an ambiguity rather than a fix — the circuit breaker's true threshold
-   is not readable from the config. Collapse to one key.
+3. ~~**Duplicate daily-loss keys, different values.**~~ **RESOLVED 2026-08-11.**
+   The code defect was already fixed: `guardrails.ts:59` reads
+   `DAILY_LOSS_LIMIT_TON || MAX_DAILY_LOSS_TON || "2.0"`, so either name works.
+   But both were deployed with *different* values (10.0 and 8), and the `||`
+   silently resolved to 10.0 — leaving a 25% discrepancy invisible to anyone
+   reading the config. The stale `MAX_DAILY_LOSS_TON` has been unset on
+   `ton-agent-runtime`; `DAILY_LOSS_LIMIT_TON=10.0` now governs unambiguously.
+   Effective limit unchanged.
+
+   **Note for workstream 0:** a 10.0 TON daily limit would NOT have stopped
+   2026-08-09, which realized −8.66 TON. The threshold is a workstream-0 output
+   and should be revisited once per-trade economics are understood. The
+   compatibility fallback in `guardrails.ts:59` should be kept — it is correct
+   and defensive; only the duplicate deployment was the problem.
 4. **§4.0a's 108% gas ratio may describe a retired configuration.** Production
    runs `SNIPER_PER_TRADE_TON=1.62`, but the 125 historical positions average
    ~0.065 TON spend (8.10 TON total). The 108% aggregate came from those much
