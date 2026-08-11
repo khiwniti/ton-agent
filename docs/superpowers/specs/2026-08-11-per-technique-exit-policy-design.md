@@ -60,6 +60,51 @@ ends 2026-08-07, so late entries cannot resolve within it. Separating genuine
 pool-death from window-truncation is a precondition for every parameter in this
 design.
 
+### PRODUCTION EVIDENCE (2026-08-11) — reorders this entire design
+
+Read live from `ton-agent-runtime:/app/data/agent.db` (136MB; 125 positions,
+84 trade transactions, 11 sniper positions, 235,611 journal rows).
+
+| Status | n | Realized PnL | Gas | Spent | Best |
+|---|---|---|---|---|---|
+| CLOSED | 82 | **−9.0128 TON** | 8.75 | 8.10 | **−1.9%** |
+| RUG_EXIT | 26 | −0.0164 | 0 | 2.60 | −0.1% |
+| STOPPED | 2 | −0.1714 | 0 | 0.20 | −85.7% |
+| OPEN | 15 | — | — | 1.50 | +14.4% |
+
+`daily_pnl_log`: `2026-08-08 = −0.5405`, `2026-08-09 = −8.6607 TON`.
+
+Three findings, each of which invalidates part of what precedes it:
+
+**F1 — No position has ever closed profitably.** Best closed PnL across all 82
+CLOSED positions is **−1.9%**. Every status has a negative `best_pct`.
+
+**F2 — Gas is 8.75 TON against 8.10 TON deployed: 108% of notional.** More was
+paid in gas than was traded. This is why `worst_pct` reaches −201.5% — losses
+exceeding 100% of position value are only reachable when gas exceeds notional.
+**The round trip is negative-expectancy before any price movement.** No TP/SL
+policy can repair this; it is a cost-structure defect, not an exit defect.
+
+**F3 — The giveback trail has no data to be swept on.** All 11 sniper positions
+record `peak_gain_pct = 0.0` — `peak_price_ton` never exceeded entry on any
+position. A profit-armed trail would have armed zero times. §2.5's sweep
+**cannot** produce values from production data as it stands.
+
+Two further signals from `decision_journal.final_action`:
+
+- `time_exit` **25,938** vs `trend_exit` **4,571** — the deployed configuration
+  differs from the checked-out defaults, which have time-stops at `0`. Deployed
+  config must be reconciled before any parameter is trusted.
+- `cannot-enforce-slippage:no-quote` **20,873** and `unquotable` **165** — the
+  zero-exit-liquidity case of §4E is not hypothetical. It has occurred ~21,000
+  times in production.
+
+**Consequence: the SNIPER exit work in §2.2 is premature.** Exit policy governs
+*when* to close a position. It cannot make a trade profitable whose round-trip
+cost exceeds its notional, and it cannot arm a profit trail on positions that
+are never in profit. Gas economics and the entry/pricing path are upstream and
+must be resolved first. See §4.0.
+
 ### Secondary problem: the differentiation is nominal
 
 The rules that would distinguish SNIPER from SWING are already written and all
@@ -269,9 +314,36 @@ Both continue to journal every decision to the shared append-only
 Current state: **108 unit tests, all synthetic hand-written series.** One real
 dataset exercising `TrendTracker` **only**. `rug-detector.ts` has **zero tests**.
 
-Five workstreams, in dependency order.
+Six workstreams, in dependency order. **§4.0 blocks everything else.**
 
-### A. Port + verify the dataset (blocking)
+### 0. Economic viability (BLOCKING — added 2026-08-11 from production data)
+
+Nothing below matters until the round trip can be profitable. Three questions,
+each answerable from the production DB:
+
+**0a. Gas-to-notional.** Gas ran 108% of deployed capital (F2). Establish the
+**minimum viable position size** at which round-trip gas is an acceptable
+fraction of notional, and gate entry on it. A trade that cannot clear its own
+gas must not be opened. Cross-check `trade_transactions.gas_fees` against
+`input_amount` per trade to get the real distribution rather than the aggregate.
+
+**0b. Why no position ever closes green (F1).** 82 closes, zero winners, best
+−1.9%. A distribution that one-sided points at entry selection or price
+reading, not exit timing. Specifically re-verify the jetton balance read
+(`get_wallet_data` vs. storage-rent, the 2026-08-08 class of bug) and whether
+`entry_price_ton` and `current_price_ton` are denominated consistently.
+
+**0c. The 21k no-quote events.** `cannot-enforce-slippage:no-quote` ×20,873.
+Determine whether these are retry storms against dead pools (the 7→<2 TON drain
+signature) or benign scanner noise, and bound the retry accordingly.
+
+**Exit criterion:** a demonstrated positive-expectancy round trip at a stated
+minimum position size, or an explicit decision to stop trading the technique.
+
+**Until 0a–0c are answered, do not tune exit parameters.** Tuning an exit on a
+negative-expectancy round trip optimizes the rate of loss.
+
+### A. Port + verify the dataset (blocking for C, not for 0)
 
 `backtest-trend-exit.ts` exists only on `feat/live-monitor-trend-exit`; the
 27MB output is on this branch but the script that produced it is not. Port it.
@@ -354,17 +426,24 @@ disconnected. It must assert bounded retry and a terminal state, not an action.
 ## 5. Rollout
 
 1. Merge with **every new key disabled**. Zero live behaviour change.
-2. Workstream A → verified noClose figure.
-3. Workstream D → rug-detector covered (independent, can run in parallel).
-4. Workstream B → replay harness.
-5. Workstream C → swept defaults.
-6. Workstream E → real-life cases.
-7. Operator enables keys explicitly, one technique at a time, observing.
+2. **Workstream 0 → economic viability. BLOCKING.** No exit tuning before this.
+3. Workstream D → rug-detector covered (independent, parallelisable with 0).
+4. Workstream A → verified noClose figure.
+5. Workstream B → replay harness.
+6. Workstream C → swept defaults — **only if 0 establishes positive expectancy
+   and F3 is resolved** (a giveback trail cannot be swept on positions that are
+   never in profit).
+7. Workstream E → real-life cases.
+8. Operator enables keys explicitly, one technique at a time, observing.
 
-`OBSERVE_ONLY=true` remains the outer safety net throughout.
+`OBSERVE_ONLY=true` remains the outer safety net throughout. Given F1/F2 it
+should stay set until workstream 0 closes.
 
 ## 6. Success criteria
 
+- **Workstream 0 closed: a positive-expectancy round trip is demonstrated at a
+  stated minimum position size** — or the technique is explicitly retired. This
+  supersedes every criterion below; none of them are meaningful without it.
 - Each technique's TP/SL/time policy is explicit, distinct, and traceable to a
   liquidity/payoff rationale.
 - No live behaviour change on merge.
@@ -375,8 +454,15 @@ disconnected. It must assert bounded retry and a terminal state, not an action.
 
 ## 7. Open questions
 
+0. **Is the SNIPER technique economically viable at all?** F1/F2 say the round
+   trip has never been profitable and gas exceeds notional. If workstream 0
+   cannot establish a viable minimum size, §2.2 should be withdrawn rather than
+   tuned. This outranks every question below.
 1. **Unresolved: the chain's actual text.** §2 was designed without it. Paste or
    export it and re-verify.
+2. **Deployed config vs. repo defaults diverge.** `time_exit` fired 25,938 times
+   in production while the checked-out default is `0` (disabled). Reconcile
+   before trusting any parameter claim in this document.
 2. Does the verified noClose figure still justify the time-stop, or does it
    collapse toward the dataset edge?
 3. Should the `excess` input in `effectiveStopPct` be bounded, or the curve
