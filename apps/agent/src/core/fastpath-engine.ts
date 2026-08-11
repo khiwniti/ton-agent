@@ -187,7 +187,12 @@ export class FastPathEngine {
       }
 
       const prediction = await coord.predictionService.predict(ohlcvData);
-      return prediction || null;
+      if (!prediction) return null;
+      return {
+        direction: prediction.signal === "buy" ? "up" : prediction.signal === "sell" ? "down" : "sideways",
+        confidence: prediction.confidence,
+        predictedChangePercent: prediction.expectedReturn,
+      };
     } catch (error) {
       log.warn("FASTPATH_ML", `Failed to get ML prediction: ${error instanceof Error ? error.message : String(error)}`);
       return null;

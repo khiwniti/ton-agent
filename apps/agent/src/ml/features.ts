@@ -328,7 +328,38 @@ export class FeatureEngine {
         // Market regime features
         volatility: volatility,
         trendStrength: trendStrength,
-        marketMomentum: marketMomentum
+        marketMomentum: marketMomentum,
+
+        // Raw feature dict (cache key input for PredictionService)
+        features: {
+          rsi: rsiValues[rsiValues.length - 1],
+          macd: macdResult.macd[macdResult.macd.length - 1],
+          macdSignal: macdResult.signal[macdResult.signal.length - 1],
+          macdHistogram: macdResult.histogram[macdResult.histogram.length - 1],
+          sma20: sma20[sma20.length - 1],
+          sma50: sma50[sma50.length - 1],
+          ema12: ema12[ema12.length - 1],
+          ema26: ema26[ema26.length - 1],
+          rsi14: rsiValues[rsiValues.length - 1],
+          close: window.close[window.close.length - 1],
+          volume: window.volume[window.volume.length - 1],
+          atr: atrValues[atrValues.length - 1],
+          obv: obvValues[obvValues.length - 1],
+          roc: rocValues[rocValues.length - 1],
+          stochasticK: stochResult.k[stochResult.k.length - 1],
+          stochasticD: stochResult.d[stochResult.d.length - 1],
+          bollingerUpper: bbResult.upper[bbResult.upper.length - 1],
+          bollingerMiddle: bbResult.middle[bbResult.middle.length - 1],
+          bollingerLower: bbResult.lower[bbResult.lower.length - 1],
+          volumeSma20: volumeSma20[volumeSma20.length - 1],
+          priceChange: priceChange,
+          priceChangePercent: priceChangePercent,
+          volumeChange: volumeChange,
+          volumeChangePercent: volumeChangePercent,
+          volatility: volatility,
+          trendStrength: trendStrength,
+          marketMomentum: marketMomentum
+        }
       };
       
       return featureVector;
@@ -471,5 +502,6 @@ export function extractFeaturesFromCandles(candles: Array<{ timestamp: number; o
     volatility: 0.02,
     trendStrength: 0.5,
     marketMomentum: 0,
+    features: {},
   };
 }

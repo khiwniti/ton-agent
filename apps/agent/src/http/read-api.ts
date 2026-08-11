@@ -245,9 +245,9 @@ export async function handleApiRequest(
       return;
     }
     const reason = typeof body.reason === "string" ? body.reason : undefined;
-    const result = getCoordinator().setKillSwitch(engaged, reason);
+    getCoordinator().setKillSwitch(engaged, reason);
     log.info("READ-API", `kill switch set by operator: engaged=${engaged}`);
-    sendJson(res, 200, { ok: true, ...result });
+    sendJson(res, 200, { ok: true });
     return;
   }
 

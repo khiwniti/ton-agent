@@ -38,7 +38,6 @@ import {
     notifyWebTool,
     checkRiskStatusTool,
     recordPositionTool,
-    localSlmReasoningTool,
 } from "../mcp/tools";
 // Side-effect import: registers all skills + exposes availableSkillsSection().
 import { availableSkillsSection } from "../skills";
@@ -144,7 +143,7 @@ const researchTools: any[] = [];
 if (CONFIG.exaApiKey) {
     const exaClient = new Exa(CONFIG.exaApiKey);
     researchTools.push(new ExaSearchResults({
-        client: exaClient,
+        client: exaClient as any, // two exa-js copies in node_modules; types structurally differ
         searchArgs: { numResults: 5 },
     }));
 }
@@ -159,7 +158,6 @@ const tools = [
     notifyWebTool,
     checkRiskStatusTool,
     recordPositionTool,
-    localSlmReasoningTool,
     ...researchTools,
 ];
 
