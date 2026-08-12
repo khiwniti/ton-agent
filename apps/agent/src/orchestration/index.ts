@@ -14,7 +14,6 @@ export {
   type TodoItem,
   type TradeTicket,
   type CapCheckResult,
-  type HitlStatus,
   type RiskAssessment,
   type Tier,
 } from "./state";
@@ -23,7 +22,6 @@ export {
 export { marketScannerNode, makeMarketScannerAgent, type MarketScannerInput, type MarketScannerOutput } from "./nodes/market-scanner";
 export { riskAnalystNode, makeRiskAnalystAgent, type RiskAnalystInput, type RiskAnalystOutput } from "./nodes/risk-analyst";
 export { strategyNode, makeStrategyAgent, type StrategyInput, type StrategyOutput } from "./nodes/strategy";
-export { hitlNode, resolveHitl, expireStaleHitl, type HitlInput, type HitlOutput } from "./nodes/hitl";
 export { executionNode, makeAuthorizedExecution, type ExecutionInput, type ExecutionOutput } from "./nodes/execution";
 export { postmortemNode, makePostmortemAgent, type PostmortemInput, type PostmortemOutput } from "./nodes/postmortem";
 export { supervisorNode, makeSupervisorAgent, type SupervisorInput, type SupervisorOutput } from "./nodes/supervisor";

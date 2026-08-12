@@ -18,7 +18,6 @@ function ctx(overrides: Partial<CapCheckContext> = {}): CapCheckContext {
     circuit_breaker_ok: true,
     observe_only: false,
     daily_pnl_ton: 0,
-    auto_approve_ceiling_pct: 100,
     max_portfolio_allocation_pct: 50,
     max_slippage_pct: 1.5,
     max_trade_pool_tvl_pct: 5,
@@ -93,7 +92,7 @@ test("kill-switch in context discards at SafetyCaps", async () => {
   assert.equal(out.cap_check_result?.ok, false);
 });
 
-test("caution path is ok but HITL pending", async () => {
+test("caution path greenlights autonomously — no pending approval", async () => {
   clearAuthorizationRegistry();
   const state = emptyGramState({
     cycle_id: "c_caution",
@@ -110,6 +109,10 @@ test("caution path is ok but HITL pending", async () => {
   const out = await runRiskPipeline(state, ctx());
   assert.equal(out.discarded, false);
   assert.equal(out.cap_check_result?.ok, true);
-  assert.equal(out.cap_check_result?.hitl_required, true);
-  assert.equal(out.hitl_status, "pending");
+  assert.equal("hitl_status" in out, false, "state must not carry hitl_status");
+  assert.equal(
+    "hitl_required" in (out.cap_check_result ?? {}),
+    false,
+    "cap must not carry hitl_required",
+  );
 });

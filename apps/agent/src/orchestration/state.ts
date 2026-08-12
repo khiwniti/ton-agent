@@ -4,13 +4,12 @@
  */
 import type {
   CapCheckResult,
-  HitlStatus,
   RiskAssessment,
   Tier,
   TradeTicket,
 } from "../safetycaps";
 
-export type { CapCheckResult, HitlStatus, RiskAssessment, Tier, TradeTicket };
+export type { CapCheckResult, RiskAssessment, Tier, TradeTicket };
 
 export interface JettonCandidate {
   jetton_master: string;
@@ -37,13 +36,12 @@ export interface TodoItem {
 export interface GramTradeState {
   cycle_id: string;
   tier: Tier;
-  /** Optional seed from scheduler or Telegram command */
+  /** Optional seed from the scheduler. */
   seed_jetton_master?: string;
   candidate: JettonCandidate | null;
   risk_assessment: RiskAssessment | null;
   proposed_ticket: TradeTicket | null;
   cap_check_result: CapCheckResult | null;
-  hitl_status: HitlStatus;
   execution_result: ExecutionResult | null;
   /** Current open positions for context */
   open_positions: number;
@@ -62,7 +60,6 @@ export function emptyGramState(
     risk_assessment: null,
     proposed_ticket: null,
     cap_check_result: null,
-    hitl_status: "not_required",
     execution_result: null,
     open_positions: 0,
     discarded: false,

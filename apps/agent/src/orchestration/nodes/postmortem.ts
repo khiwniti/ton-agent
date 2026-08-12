@@ -60,7 +60,6 @@ export function buildDeterministicSummary(cycleId: string, entries: DbJournalEnt
   // Extract key events
   const capEntry = sorted.find((e) => e.cap_check_result);
   const execEntry = sorted.find((e) => e.final_action?.startsWith("execute_"));
-  const hitlEntry = sorted.find((e) => e.hitl_status && e.hitl_status !== "not_required");
 
   let outcome = "UNKNOWN";
   let txHash = "N/A";
@@ -80,8 +79,6 @@ export function buildDeterministicSummary(cycleId: string, entries: DbJournalEnt
       outcome = "FAILED";
     } else if (execEntry.final_action === "execute_denied_caps") {
       outcome = "DENIED (SafetyCaps)";
-    } else if (execEntry.final_action === "execute_denied_hitl") {
-      outcome = "DENIED (HITL)";
     } else if (execEntry.final_action?.startsWith("execute_denied")) {
       outcome = `DENIED (${execEntry.final_action})`;
     }
@@ -102,7 +99,7 @@ export function buildDeterministicSummary(cycleId: string, entries: DbJournalEnt
       const cap = JSON.parse(capEntry.cap_check_result);
       riskVerdict = cap.failures?.length > 0
         ? cap.failures.map((f: any) => f.code).join(", ")
-        : cap.hitl_required ? "HITL required" : "PASS";
+        : "PASS";
     } catch {}
   }
 
@@ -113,7 +110,6 @@ export function buildDeterministicSummary(cycleId: string, entries: DbJournalEnt
     `<b>TX:</b> <code>${txHash}</code>\n` +
     `<b>Duration:</b> ${durationMin} min\n` +
     `<b>Risk Gate:</b> ${riskVerdict}\n` +
-    `<b>HITL:</b> ${hitlEntry?.hitl_status ?? "not required"}\n` +
     `<b>Path:</b> ${agentSequence}\n` +
     `<b>Journal:</b> ${sorted.length} entries`;
 

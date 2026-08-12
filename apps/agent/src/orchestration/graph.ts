@@ -2,10 +2,11 @@
  * GRAM Supervisor Graph — LangGraph Deep Agents topology (Phase 2).
  *
  * Topology:
- * START → Supervisor → Market Scanner → Risk Analyst → Risk Gate → Strategy → SafetyCaps → HITL (conditional) → Execution → Postmortem → END
+ * START → Supervisor → Market Scanner → Risk Analyst → Risk Gate → Strategy → SafetyCaps → Execution → Postmortem → END
  *
  * Risk Gate and SafetyCaps are pure TS graph nodes (not LLM tools).
- * HITL interrupt only before Execution when size ≥ auto-approve ceiling OR risk verdict = caution.
+ * Fully autonomous: a ticket with cap.ok === true executes immediately.
+ * There is no human approval step — every gate is deterministic.
  * Specialist sub-agents as tools with appropriately scoped tool sets.
  * Cold path (LLM) vs Hot path (native TS) separation.
  */
@@ -18,14 +19,12 @@ import { supervisorNode } from "./nodes/supervisor";
 import { marketScannerNode } from "./nodes/market-scanner";
 import { riskAnalystNode } from "./nodes/risk-analyst";
 import { strategyNode } from "./nodes/strategy";
-import { hitlNode, resolveHitl } from "./nodes/hitl";
 import { executionNode, makeAuthorizedExecution } from "./nodes/execution";
 import { postmortemNode } from "./nodes/postmortem";
 import type {
   CapCheckResult,
   ExecutionResult,
   GramTradeState,
-  HitlStatus,
   JettonCandidate,
   RiskAssessment,
   Tier,
@@ -41,7 +40,6 @@ const GramAnnotation = Annotation.Root({
   risk_assessment: Annotation<RiskAssessment | null>,
   proposed_ticket: Annotation<TradeTicket | null>,
   cap_check_result: Annotation<CapCheckResult | null>,
-  hitl_status: Annotation<HitlStatus>,
   execution_result: Annotation<ExecutionResult | null>,
   open_positions: Annotation<number>,
   discarded: Annotation<boolean>,
@@ -116,31 +114,12 @@ export function buildGramSupervisorGraph(
     })
     // SafetyCaps — deterministic authorization
     .addNode("safety_caps", (s: GramTradeState) => safetyCaps(s))
-    // HITL — Telegram approval interrupt (pauses graph)
-    .addNode("hitl", async (state: GramTradeState) => {
-      if (!state.proposed_ticket || !state.cap_check_result) return {};
-      const out = await hitlNode({
-        cycle_id: state.cycle_id,
-        ticket: state.proposed_ticket,
-        cap: state.cap_check_result,
-      });
-      return {
-        hitl_status: out.hitl_status,
-        cap_check_result: out.cap,
-        discarded: !out.proceed && out.hitl_status !== "pending", // Discard if denied/timeout
-        discard_reason: out.hitl_status === "denied" ? "HITL denied" : out.hitl_status === "timeout" ? "HITL timeout" : undefined,
-      };
-    })
-    // Execution — mechanical swap (only after SafetyCaps + HITL)
+    // Execution — mechanical swap (only after SafetyCaps)
     .addNode("execution", async (state: GramTradeState) => {
       if (!state.proposed_ticket || !state.cap_check_result) return {};
-      if (state.cap_check_result.hitl_required && state.hitl_status !== "approved") {
-        return { discarded: true, discard_reason: "HITL not approved" };
-      }
       const authorized = makeAuthorizedExecution(
         state.proposed_ticket,
         state.cap_check_result,
-        state.hitl_status,
       );
       const out = await executionNode({ cycle_id: state.cycle_id, authorized });
       return {
@@ -168,7 +147,6 @@ export function buildGramSupervisorGraph(
         risk_gate: "risk_gate",
         strategy: "strategy",
         safety_caps: "safety_caps",
-        hitl: "hitl",
         execution: "execution",
         postmortem: "postmortem",
         end: END,
@@ -186,18 +164,8 @@ export function buildGramSupervisorGraph(
       "safety_caps",
       (s) => {
         if (s.discarded) return "end";
-        if (s.cap_check_result?.hitl_required && s.hitl_status === "pending") return "hitl";
         if (s.cap_check_result?.ok) return "execution";
         return "end";
-      },
-      { end: END, hitl: "hitl", execution: "execution" },
-    )
-    .addConditionalEdges(
-      "hitl",
-      (s) => {
-        if (s.discarded) return "end";
-        if (s.hitl_status === "approved") return "execution";
-        return "end"; // denied or timeout
       },
       { end: END, execution: "execution" },
     )

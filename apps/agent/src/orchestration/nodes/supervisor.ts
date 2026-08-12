@@ -21,15 +21,13 @@ export interface SupervisorInput {
   tier: "low" | "mid" | "high";
   /** Optional: seed from scheduler / Telegram */
   seed_jetton_master?: string;
-  /** Optional: resume from HITL */
-  hitl_resume?: { approval_id: string; action: "approve" | "deny" };
 }
 
 export interface SupervisorOutput {
   /** Updated state for graph continuation */
   state: Partial<GramTradeState>;
   /** Next node hint for conditional routing */
-  next: "market_scanner" | "risk_analyst" | "risk_gate" | "strategy" | "safety_caps" | "hitl" | "execution" | "postmortem" | "end";
+  next: "market_scanner" | "risk_analyst" | "risk_gate" | "strategy" | "safety_caps" | "execution" | "postmortem" | "end";
   /** Human-readable plan step */
   plan_step: string;
 }
@@ -44,9 +42,8 @@ function buildInitialPlan(cycleId: string, seedJetton?: string): TodoItem[] {
     { id: `${cycleId}-3`, content: "Risk gate (deterministic)", status: "pending" },
     { id: `${cycleId}-4`, content: "Strategy & sizing", status: "pending" },
     { id: `${cycleId}-5`, content: "SafetyCaps authorization", status: "pending" },
-    { id: `${cycleId}-6`, content: "HITL approval (if required)", status: "pending" },
-    { id: `${cycleId}-7`, content: "Execute swap", status: "pending" },
-    { id: `${cycleId}-8`, content: "Postmortem journal", status: "pending" },
+    { id: `${cycleId}-6`, content: "Execute swap", status: "pending" },
+    { id: `${cycleId}-7`, content: "Postmortem journal", status: "pending" },
   ];
 }
 
@@ -75,8 +72,7 @@ SPECIALISTS (invoke as tools):
 2. risk_analyst — read-only security audit, returns RiskAssessment (pass/caution/reject)
 3. strategy — sizing + exit plan, returns TradeTicket proposal
 4. safety_caps — deterministic authorization (graph node, not a tool)
-5. hitl — Telegram approval interrupt (graph node)
-6. execution — mechanical swap execution (graph node)
+5. execution — mechanical swap execution (graph node)
 6. postmortem — journal summary (graph node)
 
 YOUR JOB:
@@ -91,8 +87,8 @@ DECISION RULES:
 - If risk_analyst verdict="reject" → next="end", discarded=true
 - If risk_gate (deterministic) discards → next="end"
 - If strategy returns no ticket (size=0) → next="end", discarded=true
-- If safety_caps hitl_required → next="hitl" (graph pauses)
-- If safety_caps ok + no HITL → next="execution"
+- If safety_caps ok → next="execution"
+- If safety_caps discards → next="end"
 - After execution → next="postmortem"
 - After postmortem → next="end"
 
@@ -178,7 +174,7 @@ export async function supervisorNode(
   state: GramTradeState,
   getTierState: (tier: string) => Promise<{ balance_ton: number; open_positions: number }>,
 ): Promise<SupervisorOutput> {
-  const { cycle_id, tier, discarded, candidate, risk_assessment, proposed_ticket, cap_check_result, hitl_status, execution_result, todo_plan } = state;
+  const { cycle_id, tier, discarded, candidate, risk_assessment, proposed_ticket, cap_check_result, execution_result, todo_plan } = state;
 
   if (discarded) {
     return { state: {}, next: "end", plan_step: "Cycle discarded — ending" };
@@ -283,15 +279,15 @@ export async function supervisorNode(
   }
 
   // Phase 4: After SafetyCaps (handled by graph edges)
-  // This node doesn't handle SafetyCaps/HITL/Execution directly — those are separate graph nodes
+  // This node doesn't handle SafetyCaps/Execution directly — those are separate graph nodes
 
   // Phase 5: Postmortem (after execution)
-  if (execution_result && plan[7].status !== "done") {
+  if (execution_result && plan[6].status !== "done") {
     const postOut = await postmortemNode({ cycle_id });
     return {
       state: {
         journal_ref: postOut.summary,
-        todo_plan: updatePlanItem(plan, `${cycle_id}-8`, "done"),
+        todo_plan: updatePlanItem(plan, `${cycle_id}-7`, "done"),
       },
       next: "end",
       plan_step: `Postmortem complete: ${postOut.summary}`,
@@ -303,9 +299,8 @@ export async function supervisorNode(
   if (!risk_assessment) return { state: {}, next: "risk_analyst", plan_step: "Running risk analysis" };
   if (!proposed_ticket) return { state: {}, next: "strategy", plan_step: "Planning strategy" };
   if (!cap_check_result) return { state: {}, next: "safety_caps", plan_step: "Requesting SafetyCaps authorization" };
-  if (cap_check_result && cap_check_result.hitl_required && hitl_status === "pending") return { state: {}, next: "hitl", plan_step: "Awaiting HITL approval" };
-  if (cap_check_result && cap_check_result.ok && !cap_check_result.hitl_required && !execution_result) return { state: {}, next: "execution", plan_step: "Executing swap" };
-  if (execution_result && !plan[7].status) return { state: {}, next: "postmortem", plan_step: "Generating postmortem" };
+  if (cap_check_result && cap_check_result.ok && !execution_result) return { state: {}, next: "execution", plan_step: "Executing swap" };
+  if (execution_result && !plan[6].status) return { state: {}, next: "postmortem", plan_step: "Generating postmortem" };
 
   return { state: {}, next: "end", plan_step: "Cycle complete" };
 }
