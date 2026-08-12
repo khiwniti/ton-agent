@@ -18,6 +18,8 @@ import { CONFIG } from "../config";
 import { log } from "../logger";
 import { newId, type RiskTier, type RadarEvent } from "@ton-agent/shared";
 import { fullAudit } from "../security/audit";
+import { resolvePool } from "../security/pool-resolver";
+import { Address } from "@ton/ton";
 import { computeConfidenceScore } from "../risk/scoring";
 import { makeClient } from "../wallet/wallet";
 import { runTradeBrain } from "../ai/brain";
@@ -27,8 +29,9 @@ import { tryConsumeLlmCall } from "./llm-budget";
 
 // Actual TONAPI /jettons response shape (as of 2026-07).
 // Top-level fields: mintable, total_supply, metadata, preview, verification,
-// holders_count, code_hash, data_hash, interfaces. Address lives in metadata,
-// pool info is NOT included — the radar discovers pools via audit.
+// holders_count, code_hash, data_hash, interfaces. Address lives in metadata.
+// Pool info is NOT included here — the radar resolves pools via resolvePool
+// before running the audit (LP-lock and honeypot checks need a pool address).
 interface TonapiJetton {
   mintable: boolean;
   total_supply: string;
@@ -112,7 +115,26 @@ export async function startRadar(_printOnly = false) {
       for (const c of candidates) {
         SEEN.add(c.master);
         try {
-          const audit = await fullAudit(client, c.master, c.pool);
+          // Discover the DEX pool first. The audit's LP-lock and honeypot
+          // checks are skipped without a pool address, and TONAPI /jettons
+          // does not include one — so candidates were failing with
+          // lpLocked=false / "no pool provided" no matter the token.
+          // resolvePool caches successes (24h) but deliberately NOT failures;
+          // in-process revisits are blocked by SEEN anyway, so a fresh cold
+          // start re-resolves everything instead of inheriting negatives.
+          let poolAddr = c.pool;
+          let liquidityTon = c.liquidityTon ?? null;
+          if (!poolAddr) {
+            try {
+              const pr = await resolvePool(client, Address.parse(c.master));
+              poolAddr = pr.poolAddress ?? undefined;
+              liquidityTon = pr.liquidityTon;
+            } catch {
+              // resolvePool is fail-soft; an unresolvable master stays pool-less.
+            }
+          }
+
+          const audit = await fullAudit(client, c.master, poolAddr);
           if (!audit.ok) {
             log.warn("RADAR", `skip ${c.master.slice(0, 8)}… audit failed`);
             continue;
@@ -126,8 +148,8 @@ export async function startRadar(_printOnly = false) {
             honeypotSafe: audit.honeypotSafe,
             holders: audit.holders,
             ageHours: audit.ageHours || 0,
-            liquidityTon: c.liquidityTon ?? null,
-            poolAvailable: !!c.pool,
+            liquidityTon,
+            poolAvailable: !!poolAddr,
             tier: "low",
             minAiScore: 50, // radar uses a generous threshold — any passable audit qualifies
           });
@@ -143,7 +165,7 @@ export async function startRadar(_printOnly = false) {
           if (budget.allowed) {
             const prompt = `Candidate jetton ${c.master}\n` +
               `Symbol: ${c.symbol ?? "?"}\n` +
-              `Liquidity Ton: ${c.liquidityTon ?? "unknown"}\n` +
+              `Liquidity Ton: ${liquidityTon ?? "unknown"}\n` +
               `Audit: renounced=${audit.renounced}, lpLocked=${audit.lpLocked}, honeypotSafe=${audit.honeypotSafe}, holders=${audit.holders}\n` +
               `Build a written trade plan, choose entry size using max 15% of bankroll cap, then either BUY or SKIP. If you BUY, immediately call notify_web(kind=trade_executed).`;
 
@@ -165,8 +187,8 @@ export async function startRadar(_printOnly = false) {
             walletTier: "low",
             jettonMaster: c.master,
             symbol: c.symbol,
-            poolAddress: c.pool,
-            initialLiquidityTon: c.liquidityTon ?? null,
+            poolAddress: poolAddr,
+            initialLiquidityTon: liquidityTon,
             tokenAgeHours: audit.ageHours || 0,
             renounced: audit.renounced,
             lpLocked: audit.lpLocked,
