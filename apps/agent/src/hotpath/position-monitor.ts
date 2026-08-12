@@ -1014,9 +1014,8 @@ export async function runMonitor() {
 
         // ── Gas, charged once per leg and never double-booked ─────────────
         // Entry gas was never booked at buy time, so the FIRST exit absorbs
-        // it. A position past TP1 has already paid it and owes only the sell.
-        const entryGasAlreadyBooked =
-          p.status === "TP1_HIT" || p.take_profit_t1_tx != null;
+        // it. With no TP1 partials (2026-08-09), every exit is the first.
+        const entryGasAlreadyBooked = false;
         const gasTon = exitGasTon({ entryGasAlreadyBooked });
 
         // THE FIX THAT MATTERS: gas is part of the result.

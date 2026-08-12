@@ -33,7 +33,6 @@ db.exec(`
     pnl_pct REAL,
     realized_pnl_ton REAL,
     status TEXT NOT NULL,
-    take_profit_t1_tx TEXT,
     close_tx TEXT,
     close_at INTEGER,
     -- Phase 4 hot-path exit-policy state. Declared HERE (not only as an
@@ -217,7 +216,6 @@ export interface DbPosition {
   pnl_pct?: number;
   realized_pnl_ton?: number;
   status: string;
-  take_profit_t1_tx?: string;
   close_tx?: string;
   close_at?: number;
   // Phase 4 hot-path exit state (all optional/nullable for migration compat)
@@ -265,7 +263,6 @@ export const positionsStore = {
       current_price_ton: null,
       pnl_pct: null,
       realized_pnl_ton: null,
-      take_profit_t1_tx: null,
       close_tx: null,
       close_at: null,
       max_hold_ms: null,
@@ -308,7 +305,7 @@ export const positionsStore = {
         @id, @wallet_tier, @jetton_master, @symbol, @dex, @entry_tx_hash,
         @entry_price_ton, @entry_price_usd, @entry_at, @amount_tokens, @cost_basis_ton,
         COALESCE(@confidence_score, 0),
-        @current_price_ton, @pnl_pct, @realized_pnl_ton, @status, @take_profit_t1_tx, @close_tx, @close_at,
+        @current_price_ton, @pnl_pct, @realized_pnl_ton, @status, @close_tx, @close_at,
         @max_hold_ms, @exit_by_ms, COALESCE(@rugged, 0), @rugged_at, COALESCE(@emergency_exit, 0), COALESCE(@gas_ton, 0),
         @trend_bearish, @trend_confirmations, @trend_observations, @trend_reason, @trend_updated_at, @feed_confirmed,
         @atr_close_ton, @volatility_regime, @structure_stop_level_ton,
@@ -322,7 +319,6 @@ export const positionsStore = {
         pnl_pct=excluded.pnl_pct,
         realized_pnl_ton=excluded.realized_pnl_ton,
         status=excluded.status,
-        take_profit_t1_tx=COALESCE(excluded.take_profit_t1_tx, take_profit_t1_tx),
         close_tx=COALESCE(excluded.close_tx, close_tx),
         close_at=COALESCE(excluded.close_at, close_at),
         -- Phase 4 exit state. max_hold_ms/exit_by_ms set on entry only; the
@@ -758,8 +754,6 @@ db.exec(`
     peak_price_ton REAL NOT NULL,
     current_price_ton REAL,
     pnl_pct REAL,
-    tp1_hit INTEGER NOT NULL DEFAULT 0,
-    tp1_tx_hash TEXT,
     close_tx_hash TEXT,
     close_reason TEXT,
     close_at INTEGER,
@@ -814,8 +808,6 @@ export interface DbSniperPosition {
   peak_price_ton: number;
   current_price_ton: number | null;
   pnl_pct: number | null;
-  tp1_hit: number;
-  tp1_tx_hash: string | null;
   close_tx_hash: string | null;
   close_reason: string | null;
   close_at: number | null;
@@ -835,13 +827,13 @@ export const sniperPositionStore = {
       INSERT INTO sniper_positions (
         id, asset, master, symbol, status, entry_tx_hash, entry_at,
         spent_ton_nano, amount_tokens_nano, entry_price_ton, peak_price_ton,
-        current_price_ton, pnl_pct, tp1_hit, tp1_tx_hash, close_tx_hash,
+        current_price_ton, pnl_pct, close_tx_hash,
         close_reason, close_at, migrated, curve_pct_at_entry, notes,
         max_hold_ms, exit_by_ms, technique
       ) VALUES (
         @id, @asset, @master, @symbol, @status, @entry_tx_hash, @entry_at,
         @spent_ton_nano, @amount_tokens_nano, @entry_price_ton, @peak_price_ton,
-        @current_price_ton, @pnl_pct, @tp1_hit, @tp1_tx_hash, @close_tx_hash,
+        @current_price_ton, @pnl_pct, @close_tx_hash,
         @close_reason, @close_at, @migrated, @curve_pct_at_entry, @notes,
         @max_hold_ms, @exit_by_ms, @technique
       )
@@ -862,8 +854,6 @@ export const sniperPositionStore = {
         -- which is the best available proxy for the exit price.
         current_price_ton=COALESCE(excluded.current_price_ton, current_price_ton),
         pnl_pct=COALESCE(excluded.pnl_pct, pnl_pct),
-        tp1_hit=excluded.tp1_hit,
-        tp1_tx_hash=COALESCE(excluded.tp1_tx_hash, tp1_tx_hash),
         close_tx_hash=COALESCE(excluded.close_tx_hash, close_tx_hash),
         close_reason=COALESCE(excluded.close_reason, close_reason),
         close_at=COALESCE(excluded.close_at, close_at),

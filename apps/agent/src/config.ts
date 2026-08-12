@@ -239,16 +239,6 @@ export const CONFIG = {
         minScore: num("SNIPER_MIN_SCORE", 55),
         stopLossPct: num("SNIPER_STOP_LOSS_PCT", 35),
         takeProfitT1Pct: num("SNIPER_TAKE_PROFIT_T1_PCT", 100),
-        // TP2 must exceed TP1 or both tiers fire on the same tick. Router gas is
-        // a flat 0.2 TON round trip, so TP1 at +100% is only break-even on a
-        // 0.2 TON lot — the runner at TP2 is where a position actually earns.
-        takeProfitT2Pct: num("SNIPER_TAKE_PROFIT_T2_PCT", 250),
-        // Share of the position sold at TP1; the rest rides to TP2.
-        // DEPRECATED (2026-08-09): TP1/TP2/trailing exits are replaced by the
-        // trend-based close (TREND_EXIT_*). Keys retained for env compat but
-        // no longer read by the exit decision.
-        tp1SellFraction: num("SNIPER_TP1_SELL_FRACTION", 0.5),
-        trailingPct: num("SNIPER_TRAILING_PCT", 0),
         // Trend-based close (operator directive 2026-08-09): winners ride the
         // trend with NO take-profit or trailing targets — a position closes
         // when the trend SIGNIFICANTLY flips to downtrend. The static

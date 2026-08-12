@@ -71,10 +71,10 @@ export async function runMonitor() {
         positionsStore.upsert(updatedPos);
         await pushWebhook("position_update", tier, updatedPos);
 
-        // 1. Stop-Loss (SL)
+        // 1. Stop-Loss (SL) — legacy full-close only (no TP1/trailing, 2026-08-09 aligned)
         if (p.status === "OPEN" && pnl <= -cfg.stopLossPct) {
           log.trade("MGR", `[${tier.toUpperCase()}] SL triggered for ${p.symbol} at ${pnl.toFixed(1)}% (Limit: -${cfg.stopLossPct}%)`);
-          
+
           const res = await executeSwap(
             client,
             {
@@ -104,11 +104,9 @@ export async function runMonitor() {
           continue;
         }
 
-        // 2. Take-Profit 1 (TP1 - Sell 50%)
+        // 2. Take-Profit — legacy full-close only (no partials, no trailing, 2026-08-09 aligned)
         if (p.status === "OPEN" && pnl >= cfg.takeProfitPct) {
-          log.trade("MGR", `[${tier.toUpperCase()}] TP1 triggered for ${p.symbol} at ${pnl.toFixed(1)}% (Target: ${cfg.takeProfitPct}%)`);
-
-          const halfTokens = BigInt(p.amount_tokens) / 2n;
+          log.trade("MGR", `[${tier.toUpperCase()}] TP triggered for ${p.symbol} at ${pnl.toFixed(1)}% (Target: ${cfg.takeProfitPct}%)`);
 
           const res = await executeSwap(
             client,
@@ -116,66 +114,25 @@ export async function runMonitor() {
               jettonMaster: p.jetton_master,
               amountTon: 0.1,
               side: "sell",
-              jettonAmountNano: halfTokens.toString(),
+              jettonAmountNano: p.amount_tokens,
             },
             tier,
             (p.dex as any) || CONFIG.strategy.preferredDex
           );
 
           if (res.ok) {
-            const realizedPnl = (pnl / 100) * (p.cost_basis_ton / 2);
-            const tpPos = {
+            const realizedPnl = (pnl / 100) * p.cost_basis_ton;
+            const closedPos = {
               ...p,
-              status: "TP1_HIT",
+              status: "CLOSED",
+              close_at: Date.now(),
               pnl_pct: pnl,
               current_price_ton: curTon,
-              take_profit_t1_tx: "executed",
               realized_pnl_ton: realizedPnl,
-              // Update remaining tokens count for final close
-              amount_tokens: (BigInt(p.amount_tokens) - halfTokens).toString(),
-              cost_basis_ton: p.cost_basis_ton / 2,
             };
-            positionsStore.upsert(tpPos as any);
+            positionsStore.upsert(closedPos);
             dailyPnlStore.addPnl(realizedPnl);
-            await pushWebhook("position_update", tier, tpPos);
-          }
-          continue;
-        }
-
-        // 3. Trailing Stop / TP2 (After TP1 has hit)
-        if (p.status === "TP1_HIT") {
-          const hitTrailingSL = pnl <= 0; // Trailing SL to entry
-          const hitTP2 = pnl >= cfg.takeProfitPct * 2; // TP2 target
-
-          if (hitTrailingSL || hitTP2) {
-            log.trade("MGR", `[${tier.toUpperCase()}] Final exit triggered for ${p.symbol}. pnl=${pnl.toFixed(1)}%`);
-
-            const res = await executeSwap(
-              client,
-              {
-                jettonMaster: p.jetton_master,
-                amountTon: 0.1,
-                side: "sell",
-                jettonAmountNano: p.amount_tokens,
-              },
-              tier,
-              (p.dex as any) || CONFIG.strategy.preferredDex
-            );
-
-            if (res.ok) {
-              const realizedPnl = (pnl / 100) * p.cost_basis_ton;
-              const closedPos = {
-                ...p,
-                status: "CLOSED",
-                close_at: Date.now(),
-                pnl_pct: pnl,
-                current_price_ton: curTon,
-                realized_pnl_ton: (p.realized_pnl_ton || 0) + realizedPnl,
-              };
-              positionsStore.upsert(closedPos);
-              dailyPnlStore.addPnl(realizedPnl);
-              await pushWebhook("position_update", tier, closedPos);
-            }
+            await pushWebhook("position_update", tier, closedPos);
           }
         }
       } catch (e: any) {

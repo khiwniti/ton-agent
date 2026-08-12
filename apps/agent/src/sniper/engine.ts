@@ -172,7 +172,7 @@ async function sendRouterTx(args: {
   });
   return { ok: true, hash: `seqno-${seqno}` };
 }
-/** All 24 columns upsert binds as named params — fill defaults, then override. */
+/** All 22 columns upsert binds as named params — fill defaults, then override. */
 function positionRow(overrides: Partial<DbSniperPosition> & { id: string }): DbSniperPosition {
   return {
     asset: "",
@@ -187,8 +187,6 @@ function positionRow(overrides: Partial<DbSniperPosition> & { id: string }): DbS
     peak_price_ton: 0,
     current_price_ton: null,
     pnl_pct: null,
-    tp1_hit: 0,
-    tp1_tx_hash: null,
     close_tx_hash: null,
     close_reason: null,
     close_at: null,
@@ -540,7 +538,6 @@ export async function buyToken(coin: { asset: string; metadata?: { ticker?: stri
     peak_price_ton: merged.peakPriceTon,
     current_price_ton: entryPriceTon,
     pnl_pct: 0,
-    tp1_hit: accumulate ? prior.tp1_hit : 0,
     migrated: 0,
     curve_pct_at_entry: null,
     max_hold_ms: maxHoldMs,
@@ -693,7 +690,6 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
         peak_price_ton: peak,
         current_price_ton: currentPriceTon,
         pnl_pct: pnlPct,
-        tp1_hit: pos.tp1_hit,
         migrated,
         // Sticky time-stop fields (NULL tick updates preserve stored values).
         max_hold_ms: pos.max_hold_ms,
@@ -757,9 +753,7 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
         continue;
       }
 
-      // 2026-08-09: every exit is a FULL close (no TP1 partials remain).
-      const fraction = 1;
-      const sellOk = await sellToken(pos.id, kp, decision.action, decision.reason, outTon, fraction);
+      const sellOk = await sellToken(pos.id, kp, decision.action, decision.reason, outTon);
       if (sellOk) {
         trendTracker.forget(pos.id);
         holdersBaseline.delete(pos.id);
@@ -777,21 +771,14 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
 }
 
 /**
- * Sell a position through the router (curve sell).
- *
- * `fraction` < 1 is a PARTIAL exit (TP1): it sells that share of the token
- * balance, keeps the position OPEN, and sets tp1_hit so decideExit routes the
- * runner to TP2. Before this existed, TP1 sold everything and closed the
- * position, which made tp1_hit and the whole TP2 branch dead code.
+ * Sell a position through the router (curve sell) — FULL CLOSE ONLY.
+ * 2026-08-09: no TP1 partials — winners ride to trend exit, losers stop-loss.
+ * Every exit sells the full remaining position.
  */
-export async function sellToken(id: string, kp: KeyPair, action: string, reason: string, expectedOutTon?: number, fraction = 1): Promise<boolean> {
+export async function sellToken(id: string, kp: KeyPair, action: string, reason: string, expectedOutTon?: number): Promise<boolean> {
   const pos = sniperPositionStore.get(id);
   if (!pos || pos.status === "CLOSED") return false;
-  const heldNano = BigInt(pos.amount_tokens_nano);
-  const isPartial = fraction > 0 && fraction < 1;
-  const tokensNano = isPartial
-    ? (heldNano * BigInt(Math.round(fraction * 10_000))) / 10_000n
-    : heldNano;
+  const tokensNano = BigInt(pos.amount_tokens_nano);
   if (tokensNano <= 0n) return false;
 
   const quote = await getMemepadQuote({
@@ -814,38 +801,30 @@ export async function sellToken(id: string, kp: KeyPair, action: string, reason:
   if (!res.ok) throw new Error(res.error || "send failed");
 
   const outTon = nanoToTon(quote.out_amount);
-  // Realized PnL must be NET of router gas, which is flat per swap and does not
-  // scale with size. `spent_ton_nano` holds the lot only (the entry fee rode on
-  // tx.amount and was never recorded), so a full exit has to subtract BOTH legs
-  // or the daily-loss breaker under-counts every trade and fires too late.
-  const gasNano = BigInt(Math.round((isPartial ? ROUTER_GAS_TON : ROUND_TRIP_GAS_TON) * 1e9));
-  const costBasisNano = (BigInt(pos.spent_ton_nano) * BigInt(Math.round((isPartial ? fraction : 1) * 10_000))) / 10_000n;
+  // Realized PnL NET of router gas (round-trip = entry + exit gas).
+  const gasNano = BigInt(Math.round(ROUND_TRIP_GAS_TON * 1e9));
+  const costBasisNano = BigInt(pos.spent_ton_nano);
   const realized = BigInt(quote.out_amount) - costBasisNano - gasNano;
   sniperPositionStore.addRealized(dayKey(), realized);
 
-  const remainingNano = heldNano - tokensNano;
   sniperPositionStore.upsert(positionRow({
     id: pos.id,
     asset: pos.asset,
     master: pos.master,
     symbol: pos.symbol,
-    status: isPartial ? "OPEN" : "CLOSED",
+    status: "CLOSED",
     entry_at: pos.entry_at,
-    // Keep the cost basis of the REMAINING tokens so the runner's PnL and its
-    // own gas subtraction stay honest.
-    spent_ton_nano: isPartial ? (BigInt(pos.spent_ton_nano) - costBasisNano).toString() : pos.spent_ton_nano,
-    amount_tokens_nano: remainingNano.toString(),
+    spent_ton_nano: pos.spent_ton_nano,
+    amount_tokens_nano: "0",
     entry_price_ton: pos.entry_price_ton,
     peak_price_ton: pos.peak_price_ton,
-    tp1_hit: isPartial ? 1 : pos.tp1_hit,
-    tp1_tx_hash: isPartial ? (res.hash ?? null) : pos.tp1_tx_hash,
-    close_tx_hash: isPartial ? null : (res.hash ?? null),
-    close_reason: isPartial ? null : `${action}: ${reason}`,
-    close_at: isPartial ? null : Date.now(),
+    close_tx_hash: res.hash ?? null,
+    close_reason: `${action}: ${reason}`,
+    close_at: Date.now(),
     migrated: pos.migrated,
   }));
-  log.ok("SNIPER", `${isPartial ? "PARTIAL" : "EXIT"} ${pos.symbol} ${action} → ${outTon.toFixed(4)} TON gross (${nanoToTon(realized.toString()).toFixed(4)} TON net of gas)`);
-  journal(isPartial ? "partial-exit" : "exit", { id: pos.id, action, reason, outTon, fraction, realizedNano: realized.toString() });
+  log.ok("SNIPER", `EXIT ${pos.symbol} ${action} → ${outTon.toFixed(4)} TON gross (${nanoToTon(realized.toString()).toFixed(4)} TON net of gas)`);
+  journal("exit", { id: pos.id, action, reason, outTon, realizedNano: realized.toString() });
   return true;
 }
 
