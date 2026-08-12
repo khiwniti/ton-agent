@@ -282,8 +282,9 @@ export function netProceedsTon(pnlPct: number, positionTon: number, gasTon: numb
 // the 2026-08-09 directive forbids: a trailing ratchet is loss-side; the
 // giveback arms only in profit and its level is clamped to NET breakeven, so
 // it can never fire at a loss and never tightens below the static floor.
-// Ships OFF (SNIPER_GIVEBACK_ENABLED=false) — behaviour-neutral until the
-// workstream-C sweep picks values.
+// Ships ON (default) per spec 2026-08-12 — the aligned-TP/SL design makes
+// the giveback trail the core winner-close; a prod secret override is only
+// needed to disable it.
 
 export interface GivebackInput {
   entryPriceTon: number;
