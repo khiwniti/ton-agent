@@ -271,9 +271,9 @@ export const CONFIG = {
         // ── Peak-giveback trail (§2.2, spec 2026-08-11) ─────────────────────
         // Profit-armed, full-exit trail for winners. NOT the trailing ratchet
         // the 2026-08-09 directive forbids: arms only in profit and clamps to
-        // NET breakeven, so it can never fire at a loss. Ships OFF (behaviour-
-        // neutral) per §2.5; the workstream-C sweep picks values later.
-        givebackEnabled: bool("SNIPER_GIVEBACK_ENABLED", false),
+        // NET breakeven, so it can never fire at a loss. Ships ON (default) per
+        // spec 2026-08-12; the prod secret flip is only needed to override.
+        givebackEnabled: bool("SNIPER_GIVEBACK_ENABLED", true),
         // Arm once peak >= entry × (1 + armPct/100).
         givebackArmPct: num("SNIPER_GIVEBACK_ARM_PCT", 10),
         // Exit when price gives back dropPct% from the peak.
