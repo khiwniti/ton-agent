@@ -181,21 +181,10 @@ export const CONFIG = {
     // (FR-013 pattern). Flipping to true engages the pure
     // exit/policy-engine.ts state machine + journal-first tick loop.
     exitEngineEnabled: bool("EXIT_ENGINE_ENABLED", true),
-    // Spec 006 Phase 8 — HITL gate policy.
-    // First live BUY always requires Telegram tap (one-shot per deployment).
-    // After that, auto-trade is allowed only when aiScore >= HITL_MIN_AI_SCORE
-    // (default 70). Below-threshold signals still require explicit operator
-    // approval before signing. Set HITL_MIN_AI_SCORE=0 to disable the
-    // threshold check (only the first-trade gate remains).
-    hitlMinAiScore: num("HITL_MIN_AI_SCORE", 70),
-    // LLM trade brain. The radar's autopilot fast-path (HITL_DISABLE=true) is a
-    // complete decision path on its own: audit + confidence score + SafetyCaps.
-    // Running the ReAct brain *alongside* it buys nothing — it burns the hourly
-    // LLM budget on candidates already decided, and every streamed message is
-    // POSTed to the web webhook, which is the `agent_message` flood in the logs.
-    // Default therefore follows autopilot: brain OFF when HITL is disabled.
-    // Set LLM_BRAIN_ENABLED=true to force it back on regardless.
-    brainEnabled: bool("LLM_BRAIN_ENABLED", process.env.HITL_DISABLE !== "true"),
+    // LLM trade brain. Off by default: the deterministic audit+score path is
+    // the production path. Set LLM_BRAIN_ENABLED=true to run the ReAct planner
+    // per radar candidate.
+    brainEnabled: bool("LLM_BRAIN_ENABLED", false),
     // Ultra-accretion feature flags (FR-013)
     fastPathEnabled: bool("FAST_PATH_ENABLED", false),
     localSlmEnabled: bool("LOCAL_SLM_ENABLED", false),

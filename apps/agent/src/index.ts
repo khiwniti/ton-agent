@@ -80,14 +80,7 @@ async function main() {
     );
     log.info("BOOT", `network=${CONFIG.network} rpc=${CONFIG.rpcEndpoint}`);
     log.info("BOOT", `preferred dex=${CONFIG.strategy.preferredDex}`);
-    if (process.env.HITL_DISABLE === "true") {
-        // Autopilot: stamp first-trade-executed ONCE so the persistent HITL
-        // envelope flip stays off across restarts. The `executeSwapTool`
-        // also short-circuits the FIRST-trade branch by reading the live env
-        // each call — this pair makes it bullet-proof.
-        // markFirstTradeExecuted(); // TODO: Implement first trade gate
-        log.warn("HITL", "AUTOPILOT MODE — HITL fully disabled (operator never approves).");
-    }
+    log.warn("AUTONOMY", "FULLY AUTONOMOUS — deterministic SafetyCaps is the only execution gate.");
     log.info(
         "BOOT",
         CONFIG.brainEnabled
@@ -212,7 +205,7 @@ async function main() {
         const http = await import("node:http");
         const server = http.createServer((req, res) => {
             if (req.method !== "GET") {
-                // Spec 006 Phase 8 — LINE HITL webhook (POST /line/webhook).
+                // LINE ops webhook (POST /line/webhook).
                 if (req.method === "POST" && req.url?.startsWith("/line/webhook")) {
                     let body = "";
                     req.on("data", (chunk) => { body += chunk; });

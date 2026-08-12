@@ -96,7 +96,7 @@ const TOOL_SCHEMAS: Record<string, Tool["inputSchema"]> = {
             tier: { type: "string", enum: ["low", "mid", "high"], description: "Risk tier wallet; HIGH is promotion-gated." },
             cycleId: { type: "string", description: "Optional decision-journal cycle id." },
             ticketHash: { type: "string", description: "Optional SafetyCaps ticket_hash from a prior authorize step." },
-            riskVerdict: { type: "string", enum: ["pass", "caution", "reject"], description: "Advisory risk verdict; reject blocks; caution forces HITL." },
+            riskVerdict: { type: "string", enum: ["pass", "caution", "reject"], description: "Advisory risk verdict; reject blocks; caution is advisory only." },
             poolTvlTon: { type: "number", minimum: 0, description: "Pool TVL in TON for liquidity-depth gate." },
             slippagePct: { type: "number", minimum: 0, description: "Quoted slippage percent." },
             aiScore: { type: "number", minimum: 0, maximum: 100, description: "Optional AI confidence vs tier minAiScore." },

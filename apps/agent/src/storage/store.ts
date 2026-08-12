@@ -134,10 +134,10 @@ db.exec(`
   );
 
   -- GRAM Phase 1: append-only decision journal (never UPDATE in place)
-  -- NOTE: hitl_status was removed in safetycaps-v2 (autonomous execution).
-  -- Existing deployed DBs keep the physical column because SQLite cannot
-  -- cheaply drop one; it simply stops being written. Do not add a
-  -- destructive migration to "clean" it.
+  -- NOTE: the approval-status column was removed in safetycaps-v2
+  -- (autonomous execution). Existing deployed DBs keep the physical
+  -- column because SQLite cannot cheaply drop one; it simply stops being
+  -- written. Do not add a destructive migration to "clean" it.
   CREATE TABLE IF NOT EXISTS decision_journal (
     id TEXT PRIMARY KEY,
     cycle_id TEXT NOT NULL,
