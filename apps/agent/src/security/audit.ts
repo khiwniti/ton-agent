@@ -7,6 +7,7 @@
  */
 import { Address, beginCell, TonClient } from "@ton/ton";
 import { Blockchain } from "@ton/sandbox";
+import { CONFIG } from "../config";
 import { log } from "../logger";
 import { tonapiGet } from "../http/tonapi";
 
@@ -161,6 +162,28 @@ export async function getJetton(master: string): Promise<any> {
   }
 }
 
+/**
+ * Effective audit gate.
+ *
+ * `renounced` is a hard requirement only when `requireRenounce` is set
+ * (`AUDIT_REQUIRE_RENOUNCE`, default true). When relaxed it is ADVISORY —
+ * still computed and surfaced in the report, but no longer a blocker, so
+ * LP-lock + honeypot become the only hard gates. Note that a relaxed flag
+ * also means an unmeasurable renounce (RPC/TONAPI outage makes
+ * checkRenounced fail closed with false) no longer blocks — only the
+ * lpLocked/honeypot hard gates remain. The LP-lock check itself fails
+ * closed without a pool address (lpLocked=false), so a candidate with no
+ * resolved DEX pool can never pass.
+ */
+export function computeAuditOk(
+  renounced: boolean,
+  lpLocked: boolean,
+  honeypotSafe: boolean,
+  requireRenounce: boolean,
+): boolean {
+  return (requireRenounce ? renounced : true) && lpLocked && honeypotSafe;
+}
+
 export interface SecurityReport {
   renounced: boolean;
   lpLocked: boolean;
@@ -269,7 +292,12 @@ export async function fullAudit(client: TonClient, master: string, pool?: string
     honeypotSafe,
     holders: meta?.holders_count ?? 0,
     ageHours: 0, // TONAPI doesn't expose exact timestamp; we infer via DeepScan when needed
-    ok: renounced && lpLocked && honeypotSafe,
+    ok: computeAuditOk(
+      renounced,
+      lpLocked,
+      honeypotSafe,
+      CONFIG.strategy.auditRequireRenounce,
+    ),
     dataAvailable,
     dataUnavailableReason,
     lpLockedDetail: { passed: lpLocked, state: lpState },
