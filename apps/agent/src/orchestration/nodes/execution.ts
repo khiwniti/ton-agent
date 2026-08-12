@@ -14,7 +14,7 @@ import { executeSwap, getSwapQuote, computeMinOut, type Dex, type SwapRequest, t
 import { resolvePool, type PoolResolutionResult } from "../../security/pool-resolver";
 import { getTierSlippageCeilingBps } from "../../risk/guardrails";
 import type { CapCheckResult, TradeTicket, AuthorizedExecution } from "../../safetycaps";
-import { verifyCapBinding, hashTradeTicket, CAPS_VERSION } from "../../safetycaps";
+import { hashTradeTicket, CAPS_VERSION } from "../../safetycaps";
 import { decisionJournalStore } from "../../storage/store";
 import { newId } from "@ton-agent/shared";
 
