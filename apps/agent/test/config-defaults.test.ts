@@ -10,3 +10,11 @@ import { CONFIG } from "../src/config.js";
 test("aligned TP/SL: giveback trail ships enabled by default", () => {
   assert.equal(CONFIG.sniper.givebackEnabled, true);
 });
+
+test("aligned TP/SL: volatility-widened SL ships enabled by default", () => {
+  assert.equal(CONFIG.sniper.slVolWidenEnabled, true);
+});
+
+test("aligned TP/SL: widened-stop cap default is 50%", () => {
+  assert.equal(CONFIG.sniper.slVolWidenMaxPct, 50);
+});

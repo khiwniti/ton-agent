@@ -263,7 +263,7 @@ export const CONFIG = {
         // recomputed live at monitor time (config changes take effect on the
         // next tick).
         maxHoldMs: num("SNIPER_MAX_HOLD_MS", 0),
-        slVolWidenEnabled: bool("SNIPER_SL_VOL_WIDEN", false),
+        slVolWidenEnabled: bool("SNIPER_SL_VOL_WIDEN", true),
         // Absolute widened-stop floor cap (%). Widening is loss-side only —
         // the effective stop grows when realized vol is elevated vs the
         // entry baseline, but never trails a winner.
