@@ -3,7 +3,7 @@
  *
  * LLM agents may propose TradeTickets; only this module greenlights execution.
  */
-export { CAPS_VERSION, checkTicket, hashTradeTicket, verifyCapBinding, withHitlApproved } from "./check";
+export { CAPS_VERSION, checkTicket, hashTradeTicket, verifyCapBinding } from "./check";
 export {
   issueAuthorization,
   consumeAuthorization,
@@ -16,7 +16,6 @@ export type {
   CapCheckContext,
   CapCheckFailure,
   CapCheckResult,
-  HitlStatus,
   RiskAssessment,
   RiskVerdict,
   Tier,
@@ -33,11 +32,6 @@ import { GAS_CUSHION_TON } from "../core/gate";
 import type { CapCheckContext, CapCheckResult, Tier, TradeTicket } from "./types";
 import { checkTicket } from "./check";
 import { issueAuthorization } from "./registry";
-
-/** Auto-approve ceiling as % of sub-wallet balance. Default 100 = HITL deferred to Phase 3 sizing policy. */
-export const AUTO_APPROVE_CEILING_PCT = parseFloat(
-  process.env.AUTO_APPROVE_CEILING_PCT || "100",
-);
 
 /** Max trade as % of pool TVL when pool_tvl_ton is known. */
 export const MAX_TRADE_POOL_TVL_PCT = parseFloat(
@@ -58,7 +52,6 @@ export interface BuildCapContextInput {
   circuitBreakerOk: boolean;
   observeOnly: boolean;
   dailyPnlTon: number;
-  autoApproveCeilingPct?: number;
   maxPortfolioAllocationPct?: number;
   maxSlippagePct?: number;
   maxTradePoolTvlPct?: number;
@@ -83,8 +76,6 @@ export function buildCapContext(input: BuildCapContextInput): CapCheckContext {
     circuit_breaker_ok: input.circuitBreakerOk,
     observe_only: input.observeOnly,
     daily_pnl_ton: input.dailyPnlTon,
-    auto_approve_ceiling_pct:
-      input.autoApproveCeilingPct ?? AUTO_APPROVE_CEILING_PCT,
     max_portfolio_allocation_pct:
       input.maxPortfolioAllocationPct ?? MAX_PORTFOLIO_ALLOCATION_PCT,
     max_slippage_pct: input.maxSlippagePct ?? MAX_SLIPPAGE_PCT,
