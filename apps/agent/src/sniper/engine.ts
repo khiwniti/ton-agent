@@ -58,6 +58,7 @@ import {
   type ExitConfirmation,
   type SniperGateConfig,
 } from "./filters";
+import { worstCaseSlLossOk } from "./sizing";
 import { TrendTracker, type TrendSignal } from "../exit/trend-monitor";
 import { realizedVol } from "../exit/volatility-regime";
 import { atrBandState } from "../exit/atr-band";
@@ -391,6 +392,16 @@ export async function scanTick(kp: KeyPair | null): Promise<{ scanned: number; p
           `(flat round-trip gas ${ROUND_TRIP_GAS_TON} TON → break-even ${breakEvenPct({ positionTon: size, gasTon: ROUND_TRIP_GAS_TON }).toFixed(0)}%). ` +
           `Raise SNIPER_PER_TRADE_TON above ${minViable.toFixed(2)} or fund the wallet — refusing to open a guaranteed-loss position.`,
       );
+      continue;
+    }
+
+    // Spec §2 sizing guard: at the vol-widened stop the worst-case loss is
+    // slVolWidenMaxPct of the lot; if what survives can't clear the min-viable
+    // floor, the position is a guaranteed loss at the widened stop even if it
+    // clears at the base stop. Refuse.
+    if (worstCaseSlLossOk({ perTradeTon: size, slVolWidenMaxPct: CONFIG.sniper.slVolWidenMaxPct, minViablePositionTon: minViable }) === false) {
+      log.warn("SNIPER", `skip ${ticker}: size ${size.toFixed(3)} TON cannot survive the widened SL ` +
+        `(${(size * (1 - CONFIG.sniper.slVolWidenMaxPct / 100)).toFixed(3)} TON after -${CONFIG.sniper.slVolWidenMaxPct}% < min viable ${minViable.toFixed(3)} TON)`);
       continue;
     }
 
