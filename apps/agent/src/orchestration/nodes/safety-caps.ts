@@ -15,13 +15,18 @@ export type CapContextFactory = (state: GramTradeState) => CapCheckContext;
  */
 export function makeSafetyCapsNode(getContext: CapContextFactory) {
   return function safetyCapsNode(state: GramTradeState): Partial<GramTradeState> {
-    if (state.discarded) return {};
+    if (state.discarded) {
+      return {
+        decision: "REJECT",
+      };
+    }
 
     const ticket = state.proposed_ticket;
     if (!ticket) {
       return {
         discarded: true,
         discard_reason: "no proposed_ticket for SafetyCaps",
+        decision: "REJECT",
       };
     }
 
@@ -35,6 +40,7 @@ export function makeSafetyCapsNode(getContext: CapContextFactory) {
         discarded: true,
         discard_reason:
           cap.failures.map((f) => f.reason).join("; ") || "cap denied",
+        decision: "REJECT",
       };
     }
 

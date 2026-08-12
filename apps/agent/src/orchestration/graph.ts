@@ -33,9 +33,25 @@ const GramAnnotation = Annotation.Root({
   discard_reason: Annotation<string | undefined>,
   todo_plan: Annotation<TodoItem[]>,
   journal_ref: Annotation<string | undefined>,
+
+  // Multi-Agent annotations
+  pair_metadata: Annotation<Record<string, any> | null>,
+  security_passed: Annotation<boolean>,
+  security_report: Annotation<string>,
+  microstructure_score: Annotation<number>,
+  social_score: Annotation<number>,
+  composite_score: Annotation<number>,
+  decision: Annotation<string>,
+  execution_payload: Annotation<Record<string, any> | null>,
 });
 
 export type CompiledGramGraph = ReturnType<typeof buildGramRiskGraph>;
+
+import { sentinelNode } from "./nodes/sentinel";
+import { securityAuditorNode } from "./nodes/security-auditor";
+import { microstructureQuantNode } from "./nodes/microstructure-quant";
+import { socialSentimentNode } from "./nodes/social-sentiment";
+import { riskExecutionNode } from "./nodes/risk-execution";
 
 /**
  * Compile risk-only graph. Inject CapCheckContext via factory so tests stay pure.
@@ -65,6 +81,49 @@ export async function runRiskPipeline(
   ctx: CapCheckContext,
 ): Promise<GramTradeState> {
   const graph = buildGramRiskGraph(() => ctx);
+  const out = await graph.invoke(input);
+  return out as GramTradeState;
+}
+
+/**
+ * Compile the complete Multi-Agent Crypto Trading Brain (The Alpha Radar Graph).
+ */
+export function buildMultiAgentGraph(getContext: CapContextFactory) {
+  const safetyCaps = makeSafetyCapsNode(getContext);
+
+  return new StateGraph(GramAnnotation)
+    .addNode("sentinel", (s) => sentinelNode(s as GramTradeState))
+    .addNode("security_auditor", (s) => securityAuditorNode(s as GramTradeState))
+    .addNode("microstructure_quant", (s) => microstructureQuantNode(s as GramTradeState))
+    .addNode("social_sentiment", (s) => socialSentimentNode(s as GramTradeState))
+    .addNode("risk_execution", (s) => riskExecutionNode(s as GramTradeState))
+    .addNode("safety_caps", (s) => safetyCaps(s as GramTradeState))
+
+    .addEdge(START, "sentinel")
+    .addEdge("sentinel", "security_auditor")
+
+    // If security fails, router goes directly to safety_caps/end (fail fast)
+    .addConditionalEdges(
+      "security_auditor",
+      (s) => (s.discarded ? "safety_caps" : "microstructure_quant"),
+      {
+        safety_caps: "safety_caps",
+        microstructure_quant: "microstructure_quant",
+      }
+    )
+    .addEdge("microstructure_quant", "social_sentiment")
+    .addEdge("social_sentiment", "risk_execution")
+    .addEdge("risk_execution", "safety_caps")
+    .addEdge("safety_caps", END)
+    .compile();
+}
+
+/** Run the multi-agent pipeline on a GramTradeState. */
+export async function runMultiAgentPipeline(
+  input: GramTradeState,
+  ctx: CapCheckContext,
+): Promise<GramTradeState> {
+  const graph = buildMultiAgentGraph(() => ctx);
   const out = await graph.invoke(input);
   return out as GramTradeState;
 }
