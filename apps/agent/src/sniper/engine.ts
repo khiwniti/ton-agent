@@ -60,6 +60,7 @@ import {
 } from "./filters";
 import { TrendTracker, type TrendSignal } from "../exit/trend-monitor";
 import { realizedVol } from "../exit/volatility-regime";
+import { atrBandState } from "../exit/atr-band";
 import {
   breakEvenPct,
   minViablePositionTon,
@@ -702,6 +703,24 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
         givebackArmPct: CONFIG.sniper.givebackArmPct,
         givebackDropPct: CONFIG.sniper.givebackDropPct,
       };
+
+      // §1 ATR corroboration (spec 2026-08-12): Chandelier-style band below the
+      // peak, journaled every tick. Journal-only — never an exit trigger.
+      const band = atrBandState({
+        closes,
+        atrMult: CONFIG.strategy.trendExitAtrMult,
+        entryPriceTon: pos.entry_price_ton,
+        peakPriceTon: peak,
+      });
+      journal("atr-band", {
+        id: pos.id,
+        symbol: pos.symbol,
+        bandLevelTon: band.bandLevelTon,
+        breached: band.breached,
+        peakPriceTon: peak,
+        lastCloseTon: closes[closes.length - 1],
+      });
+
       const decision = decideExit(state);
       if (decision.action === "hold") continue;
 
