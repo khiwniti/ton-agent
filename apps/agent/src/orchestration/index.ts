@@ -1,6 +1,8 @@
 export {
   buildGramRiskGraph,
   runRiskPipeline,
+  buildMultiAgentGraph,
+  runMultiAgentPipeline,
   type CompiledGramGraph,
 } from "./graph";
 export { riskGateNode } from "./nodes/risk-gate";

@@ -79,6 +79,11 @@ export const CONFIG = {
     agentSharedSecret: req("AGENT_SHARED_SECRET"),
     nvidiaApiKey: req("NVIDIA_API_KEY"),
     nvidiaModel: opt("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b"),
+    llmProvider: opt("LLM_PROVIDER", "nvidia"),
+    ollamaBaseUrl: opt("OLLAMA_BASE_URL", "http://localhost:11434"),
+    ollamaModel: opt("OLLAMA_MODEL", "qwen2.5-coder:32b"),
+    vllmBaseUrl: opt("VLLM_BASE_URL", "http://localhost:8000"),
+    vllmModel: opt("VLLM_MODEL", "qwen2.5-coder:32b"),
     exaApiKey: opt("EXA_API_KEY", ""),
     strategy: {
         maxRiskPct: num("MAX_PORTFOLIO_RISK_PCT", 15),

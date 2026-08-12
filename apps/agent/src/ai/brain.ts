@@ -49,20 +49,13 @@ delete process.env.LANGCHAIN_API_KEY;
 delete process.env.LANGCHAIN_ENDPOINT;
 delete process.env.LANGCHAIN_PROJECT;
 
+import { getLLM } from "./llm";
+
 // ───────────────────────────────────────────────────────────────────
-// Model selection — NVIDIA NIM (nemotron-3-ultra-550b) as primary.
+// Model selection — NVIDIA NIM (nemotron-3-ultra-550b) as primary or local.
 // ───────────────────────────────────────────────────────────────────
 function pickModel() {
-    if (CONFIG.nvidiaApiKey) {
-        // NVIDIA NIM offers OpenAI-compatible endpoint with Nemotron-3-Ultra.
-        return new ChatOpenAI({
-            apiKey: CONFIG.nvidiaApiKey,
-            model: CONFIG.nvidiaModel,
-            temperature: 0.2,
-            configuration: { baseURL: "https://integrate.api.nvidia.com/v1" },
-        });
-    }
-    throw new Error("NO_LLM_KEY — set NVIDIA_API_KEY.");
+    return getLLM();
 }
 
 // ───────────────────────────────────────────────────────────────────

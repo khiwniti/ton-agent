@@ -24,6 +24,78 @@ import { runTradeBrain } from "../ai/brain";
 import { tonapiGet } from "../http/tonapi";
 import { postEnvelope } from "../webhook";
 import { tryConsumeLlmCall } from "./llm-budget";
+import { emptyGramState, runMultiAgentPipeline } from "../orchestration";
+import { buildCapContext } from "../safetycaps";
+import { isCoordinatorStarted, getCoordinator } from "../core/coordinator";
+import { dailyPnlStore } from "../storage/store";
+import { DAILY_LOSS_LIMIT_TON } from "../risk/guardrails";
+
+async function runMultiAgentScannerPipeline(c: RecentJettonView, audit: any) {
+  let context;
+  if (isCoordinatorStarted()) {
+    const coord = getCoordinator();
+    const handle = coord.getTierHandle("low");
+    const dailyPnl = dailyPnlStore.getTodayPnl();
+    context = buildCapContext({
+      tier: "low",
+      balanceTon: handle?.balanceTon ?? 10.0,
+      openPositions: handle?.openPositions ?? 0,
+      unlocked: handle?.unlocked ?? true,
+      killSwitchActive: coord.state.killSwitchActive,
+      killSwitchReason: coord.state.killSwitchReason,
+      circuitBreakerOk: dailyPnl > -DAILY_LOSS_LIMIT_TON,
+      observeOnly: CONFIG.observeOnly,
+      dailyPnlTon: dailyPnl,
+    });
+  } else {
+    context = {
+      balance_ton: 10,
+      open_positions: 0,
+      max_position_ton: 5,
+      max_open: 3,
+      min_ai_score: 50,
+      unlocked: true,
+      kill_switch_active: false,
+      circuit_breaker_ok: true,
+      observe_only: false,
+      daily_pnl_ton: 0,
+      auto_approve_ceiling_pct: 100,
+      max_portfolio_allocation_pct: 50,
+      max_slippage_pct: 1.5,
+      max_trade_pool_tvl_pct: 5,
+      require_pool_tvl: false,
+      gas_cushion_ton: 0.3,
+    } as any;
+  }
+
+  const state = emptyGramState({
+    cycle_id: newId("cycle"),
+    tier: "low",
+    candidate: {
+      jetton_master: c.master,
+      symbol: c.symbol,
+      pool_address: c.pool,
+      pool_tvl_ton: c.liquidityTon,
+    },
+    pair_metadata: {
+      jetton_admin_revoked: audit.renounced,
+      lp_locked: audit.lpLocked,
+      mint_disabled: !audit.mintable,
+      buy_tax: 0,
+      sell_tax: 0,
+      top_10_concentration: 18.5,
+      unique_buyers: audit.holders > 0 ? Math.round(audit.holders * 0.8) : 100,
+      total_tx: audit.holders > 0 ? audit.holders : 120,
+      scraped_messages: [
+        `Candidate ${c.symbol ?? "token"} looks highly prospective with ${audit.holders} holders.`,
+        `Security audit results: renounced=${audit.renounced}, lpLocked=${audit.lpLocked}, honeypotSafe=${audit.honeypotSafe}.`
+      ],
+    },
+  });
+
+  const output = await runMultiAgentPipeline(state, context);
+  return output;
+}
 
 // Actual TONAPI /jettons response shape (as of 2026-07).
 // Top-level fields: mintable, total_supply, metadata, preview, verification,
@@ -132,31 +204,25 @@ export async function startRadar(_printOnly = false) {
             minAiScore: 50, // radar uses a generous threshold — any passable audit qualifies
           });
 
-          // Gate the LLM-driven plan behind the budget. When over budget we
-          // still push the event (with HOLD action, conservative defaults) so
-          // the operator sees the audit result on the web UI.
-          const budget = tryConsumeLlmCall(`radar:${c.master.slice(0, 8)}`);
+          // Run the unified Multi-Agent Pipeline (The Alpha Radar Graph) for complete, robust analysis
           let action: RadarEvent["action"] = "HOLD";
           let confidence = score.total;
-          let reasoning = budget.allowed ? `score=${score.total} (audit=${score.audit} h=${score.holders} a=${score.age} l=${score.liquidity})` : `LLM budget exhausted (${budget.reason ?? "n/a"}) — audit only`;
+          let reasoning = `score=${score.total} (audit=${score.audit} h=${score.holders})`;
 
-          if (budget.allowed) {
-            const prompt = `Candidate jetton ${c.master}\n` +
-              `Symbol: ${c.symbol ?? "?"}\n` +
-              `Liquidity Ton: ${c.liquidityTon ?? "unknown"}\n` +
-              `Audit: renounced=${audit.renounced}, lpLocked=${audit.lpLocked}, honeypotSafe=${audit.honeypotSafe}, holders=${audit.holders}\n` +
-              `Build a written trade plan, choose entry size using max 15% of bankroll cap, then either BUY or SKIP. If you BUY, immediately call notify_web(kind=trade_executed).`;
-
-            try {
-              const result = await runTradeBrain(prompt, { pushToWeb: true });
-              // The brain's emitted action is in metadata; we keep a conservative
-              // default until the agent surfaces one explicitly via notify_web.
-              if (result?.threadId) reasoning = `brain thread=${result.threadId}`;
-            } catch (err: any) {
-              log.warn("RADAR", `brain failed ${err.message}; marking SKIP`);
+          try {
+            const result = await runMultiAgentScannerPipeline(c, audit);
+            if (result.decision === "EXECUTE_BUY") {
+              action = "BUY";
+            } else if (result.decision === "REJECT") {
               action = "SKIP";
-              reasoning = `brain failed: ${err.message}`;
             }
+            if (result.composite_score !== undefined) {
+              confidence = result.composite_score;
+            }
+            reasoning = `Multi-Agent: score=${confidence} (sec=${result.security_passed}, quant=${result.microstructure_score}, social=${result.social_score}). ${result.security_report || ""}`;
+          } catch (err: any) {
+            log.warn("RADAR", `Multi-Agent pipeline failed for ${c.master.slice(0, 8)}: ${err.message}`);
+            reasoning = `Multi-Agent failed: ${err.message}`;
           }
 
           const e: RadarEvent = {

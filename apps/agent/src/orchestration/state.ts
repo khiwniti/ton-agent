@@ -48,6 +48,16 @@ export interface GramTradeState {
   discard_reason?: string;
   todo_plan: TodoItem[];
   journal_ref?: string;
+
+  // Multi-Agent states
+  pair_metadata?: Record<string, any> | null;
+  security_passed?: boolean;
+  security_report?: string;
+  microstructure_score?: number;
+  social_score?: number;
+  composite_score?: number;
+  decision?: "EXECUTE_BUY" | "REJECT" | "HOLD";
+  execution_payload?: Record<string, any> | null;
 }
 
 export function emptyGramState(
@@ -62,6 +72,14 @@ export function emptyGramState(
     execution_result: null,
     discarded: false,
     todo_plan: [],
+    pair_metadata: null,
+    security_passed: false,
+    security_report: "",
+    microstructure_score: 0,
+    social_score: 0,
+    composite_score: 0,
+    decision: "HOLD",
+    execution_payload: null,
     ...partial,
   };
 }
