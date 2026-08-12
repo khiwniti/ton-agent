@@ -58,7 +58,7 @@ import {
   type ExitConfirmation,
   type SniperGateConfig,
 } from "./filters";
-import { worstCaseSlLossOk } from "./sizing";
+import { worstCaseSlLossOk, poolDepthCapTon, slippageProbeOk } from "./sizing";
 import { TrendTracker, type TrendSignal } from "../exit/trend-monitor";
 import { realizedVol } from "../exit/volatility-regime";
 import { atrBandState } from "../exit/atr-band";
@@ -405,6 +405,14 @@ export async function scanTick(kp: KeyPair | null): Promise<{ scanned: number; p
       continue;
     }
 
+    // Spec §4 %-of-pool-depth cap: refuse a lot that would move the pool
+    // more than maxPoolDepthSharePct against itself. Null depth → no cap.
+    const depthCap = poolDepthCapTon(coin.memecoin_extra_details?.curve_ton_collected, CONFIG.sniper.maxPoolDepthSharePct);
+    if (depthCap != null && size > depthCap) {
+      log.warn("SNIPER", `skip ${ticker}: size ${size.toFixed(3)} TON > pool depth cap ${depthCap.toFixed(3)} TON (${CONFIG.sniper.maxPoolDepthSharePct}% of ${nanoToTon(coin.memecoin_extra_details?.curve_ton_collected || "0").toFixed(3)} TON curve)`);
+      continue;
+    }
+
     if (CONFIG.observeOnly || s.dryRun || !kp) {
       log.ok("SNIPER", `DRY-RUN would buy ${ticker} ${size} TON (score ${verdict.score}) — ${asset}`);
       journal("dry-buy", { asset, ticker, sizeTon: size, score: verdict.score });
@@ -457,6 +465,14 @@ export async function buyToken(coin: { asset: string; metadata?: { ticker?: stri
   log.info("SNIPER", `quote for ${ticker}: in=${quote.in_amount} out=${quote.out_amount} data_len=${typeof quote.swap_data === "string" ? quote.swap_data.length : "?"}`);
   const expectedOutNano = BigInt(quote.out_amount ?? "0");
   if (!quote.out_amount) throw new Error(`quote missing out_amount: ${JSON.stringify(quote)}`);
+
+  // Spec §4 slippage probe: refuse a fill that moves the price beyond
+  // tolerance — buying that is a guaranteed-worse entry than the model priced.
+  const probe = slippageProbeOk(quote, CONFIG.sniper.slippageProbeMaxImpactPct);
+  if (!probe.ok) {
+    throw new Error(`slippage probe failed for ${ticker}: ${probe.reason}`);
+  }
+
   const client = makeClient();
   const wallet = openWallet(client, kp);
   const txs = await buildSwapPayload({

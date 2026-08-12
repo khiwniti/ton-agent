@@ -225,6 +225,10 @@ export const CONFIG = {
         dailyLossLimitTon: num("SNIPER_DAILY_LOSS_LIMIT_TON", 0.5),
         maxOpenPositions: num("SNIPER_MAX_OPEN_POSITIONS", 5),
         slippageBps: num("SNIPER_SLIPPAGE_BPS", 500),
+        // Sizing guard: max share of pool depth the lot may consume (spec §4).
+        maxPoolDepthSharePct: num("SNIPER_MAX_POOL_DEPTH_SHARE_PCT", 2),
+        // Sizing guard: slippage probe tolerance before refusing a fill (spec §4).
+        slippageProbeMaxImpactPct: num("SNIPER_SLIPPAGE_PROBE_MAX_IMPACT_PCT", 5),
         minCurveTon: num("SNIPER_MIN_CURVE_TON", 5),
         maxCurvePct: num("SNIPER_MAX_CURVE_PCT", 60),
         minVerificationLevel: num("SNIPER_MIN_VERIFICATION_LEVEL", 3),
