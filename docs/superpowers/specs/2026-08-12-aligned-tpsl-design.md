@@ -2,6 +2,7 @@
 
 **Date:** 2026-08-12
 **Status:** Approved by operator (2026-08-12). Live-enable decision made: ship features enabled on mainnet; workstream 0 (economic-viability) gate **waived by operator**.
+**Deployed:** yes (2026-08-12)
 
 ## Provenance
 
