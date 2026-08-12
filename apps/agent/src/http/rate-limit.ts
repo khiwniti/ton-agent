@@ -26,8 +26,8 @@
 const MAX_CONCURRENT_DEDUST = 3;   // ≤3 in-flight DeDust requests
 const MIN_GAP_MS_DEDUST     = 200; // ≥200ms between slot releases → ≤5 req/s
 
-const MAX_CONCURRENT_STONFI = 3;
-const MIN_GAP_MS_STONFI     = 200;
+const MAX_CONCURRENT_STONFI = 1;
+const MIN_GAP_MS_STONFI     = 1100; // ≥1.1s between releases → ≤0.9 req/s, under the anonymous toncenter ceiling
 
 interface BucketState {
   inflight: number;

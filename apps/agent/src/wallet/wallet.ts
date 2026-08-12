@@ -40,7 +40,15 @@ function makeThrottledAdapter() {
 }
 
 export function makeClient(): TonClient {
-  return new TonClient({ endpoint: CONFIG.rpcEndpoint, httpAdapter: makeThrottledAdapter() });
+  return new TonClient({
+    endpoint: CONFIG.rpcEndpoint,
+    // The toncenter API key was previously read into CONFIG but never passed to
+    // the client, so every RPC hit the anonymous ~1 req/s tier regardless of the
+    // shared bucket. With the key, toncenter raises the per-key ceiling (10x+)
+    // and the bucket serialization actually has headroom to work with.
+    apiKey: CONFIG.tonApiKey || undefined,
+    httpAdapter: makeThrottledAdapter(),
+  });
 }
 
 export interface KeyPair {
