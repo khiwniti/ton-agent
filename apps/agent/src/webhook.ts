@@ -63,7 +63,14 @@ export async function postEnvelope(opts: PostEnvelopeOpts): Promise<PostEnvelope
     log.ok("WEBHOOK", `OK kind=${opts.kind} id=${id}`);
     return { sent: true, id };
   } catch (e: any) {
-    log.warn("WEBHOOK", `post failed kind=${opts.kind} id=${id} → ${e.message}`);
+    const status: number | undefined = e?.response?.status;
+    if (status === 401) {
+      // Auth mismatch — config issue, not a transient error. Log at info level
+      // so it doesn't spam ERR/WARN on every tick when the secret is wrong.
+      log.info("WEBHOOK", `post failed kind=${opts.kind} id=${id} → 401 Unauthorized (check AGENT_SHARED_SECRET)`);
+    } else {
+      log.warn("WEBHOOK", `post failed kind=${opts.kind} id=${id} → ${e.message}`);
+    }
     return { sent: false, id, error: e.message };
   }
 }

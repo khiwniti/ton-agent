@@ -59,13 +59,14 @@ import {
   type SniperGateConfig,
 } from "./filters";
 import { TrendTracker, type TrendSignal } from "../exit/trend-monitor";
+import { realizedVol } from "../exit/volatility-regime";
 import {
   breakEvenPct,
   minViablePositionTon,
   ROUND_TRIP_FEE_PCT,
 } from "../economics/trade-economics";
 import { getTonUsd } from "./coingecko";
-import { tonapiGet } from "../http/tonapi";
+import { fetchHoldersTotal } from "../http/tonapi";
 
 // ── Journal helper ──────────────────────────────────────────────────
 
@@ -169,7 +170,7 @@ async function sendRouterTx(args: {
   });
   return { ok: true, hash: `seqno-${seqno}` };
 }
-/** All 21 columns upsert binds as named params — fill defaults, then override. */
+/** All 24 columns upsert binds as named params — fill defaults, then override. */
 function positionRow(overrides: Partial<DbSniperPosition> & { id: string }): DbSniperPosition {
   return {
     asset: "",
@@ -192,6 +193,9 @@ function positionRow(overrides: Partial<DbSniperPosition> & { id: string }): DbS
     migrated: 0,
     curve_pct_at_entry: null,
     notes: null,
+    max_hold_ms: null,
+    exit_by_ms: null,
+    technique: "sniper",
     ...overrides,
   };
 }
@@ -264,16 +268,6 @@ const trendDisabled: TrendSignal = {
  */
 const holdersBaseline = new Map<string, number>();
 
-async function fetchHoldersTotal(master: string): Promise<number | null> {
-  try {
-    const r = await tonapiGet(`/v2/jettons/${master}/holders`, { timeoutMs: 8000 });
-    const total = r?.total;
-    return Number.isFinite(total) ? total : null;
-  } catch {
-    return null; // fail closed — TONAPI blip must never fabricate a confirm
-  }
-}
-
 /** One discovery + gating + buy pass. Exported for tests/dry-run. */
 export async function scanTick(kp: KeyPair | null): Promise<{ scanned: number; passed: number; bought: number }> {
   const s = CONFIG.sniper;
@@ -329,6 +323,13 @@ export async function scanTick(kp: KeyPair | null): Promise<{ scanned: number; p
   // in-tick record: buys made below are added to it.
   const heldMasters = new Set(open.map((p) => p.master));
 
+  // Operator handoff guard: masters the operator traded manually are
+  // permanently off-limits to the scan. Without this the scan buy path's
+  // upsert (id = x1000-0:<master>) re-opens the CLOSED handoff row — on
+  // 2026-08-12 the engine re-bought CROAK twice the operator had already
+  // closed by hand and parked on the operator's own manual positions.
+  const handoffMasters = sniperPositionStore.handoffMasters();
+
   for (const coin of launches) {
     const asset = coin.asset;
     const ticker = coin.metadata?.ticker ?? "";
@@ -342,6 +343,10 @@ export async function scanTick(kp: KeyPair | null): Promise<{ scanned: number; p
     }
     if (heldMasters.has(master)) {
       log.info("SNIPER", `skip ${master.slice(0, 14)}… ${ticker || "?"}: already holding`);
+      continue;
+    }
+    if (handoffMasters.has(master)) {
+      log.info("SNIPER", `skip ${master.slice(0, 14)}… ${ticker || "?"}: operator handoff — not re-buying`);
       continue;
     }
 
@@ -488,6 +493,11 @@ export async function buyToken(coin: { asset: string; metadata?: { ticker?: stri
     log.warn("SNIPER", `${ticker}: adding to existing position — ${nanoToTon(prior.spent_ton_nano)} + ${sizeTon} = ${nanoToTon(merged.spentNano)} TON`);
   }
 
+  const entryAt = accumulate ? prior.entry_at : Date.now();
+  // Phase 5.1 hard time-stop: journal the deadline at open (recomputed from
+  // entry_at at monitor time, so a later SNIPER_MAX_HOLD_MS change applies
+  // to already-open positions on the next tick).
+  const maxHoldMs = CONFIG.sniper.maxHoldMs > 0 ? CONFIG.sniper.maxHoldMs : null;
   sniperPositionStore.upsert(positionRow({
     id,
     asset: coin.asset,
@@ -495,7 +505,7 @@ export async function buyToken(coin: { asset: string; metadata?: { ticker?: stri
     symbol: ticker,
     status: "OPEN",
     entry_tx_hash: res.hash ?? null,
-    entry_at: accumulate ? prior.entry_at : Date.now(),
+    entry_at: entryAt,
     spent_ton_nano: merged.spentNano.toString(),
     amount_tokens_nano: merged.tokensNano.toString(),
     entry_price_ton: merged.avgEntryPriceTon,
@@ -505,6 +515,8 @@ export async function buyToken(coin: { asset: string; metadata?: { ticker?: stri
     tp1_hit: accumulate ? prior.tp1_hit : 0,
     migrated: 0,
     curve_pct_at_entry: null,
+    max_hold_ms: maxHoldMs,
+    exit_by_ms: maxHoldMs != null ? entryAt + maxHoldMs : null,
   }));
   sniperPositionStore.addSpent(dayKey(), BigInt(amountNano));
   log.ok("SNIPER", `BOUGHT ${ticker} ${sizeTon} TON → ${nanoToTon(expectedOutNano.toString()).toExponential(3)} tokens @ ${entryPriceTon.toExponential(3)} TON/token (${tx.address.slice(0, 16)}…)`);
@@ -623,11 +635,29 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
         }
       }
 
+      // Phase 5.1 vol-widened SL: realized vol over the trend tracker's close
+      // window vs the entry baseline (first observed close). Elevated
+      // realized vol widens the effective stop loss-side only — never a
+      // trailing rule (2026-08-09 directive). The first observation is the
+      // baseline because the tracker's ring buffer seeds flat at entry, so
+      // early realized vol is ~0 until real price action lands.
+      const closes = trendTracker.closes(pos.id);
+      const volState =
+        CONFIG.sniper.slVolWidenEnabled && closes.length >= 2
+          ? { realizedVol: realizedVol(closes), baseRealizedVol: realizedVol(closes.slice(0, 2)) }
+          : undefined;
+      const maxHoldMs = pos.max_hold_ms ?? (CONFIG.sniper.maxHoldMs > 0 ? CONFIG.sniper.maxHoldMs : null);
+
       sniperPositionStore.upsert(positionRow({
         id: pos.id,
         asset: pos.asset,
         master: pos.master,
-        status: "OPEN",
+        // Preserve the stored status: a row set to CLOSED by an operator
+        // handoff (or any external close) must not be re-opened by the
+        // monitor's reprice upsert. See sniperPositionStore.upsert —
+        // `status=excluded.status` is unconditional, so a literal "OPEN"
+        // here would silently resurrect closed rows each tick.
+        status: pos.status,
         entry_at: pos.entry_at,
         spent_ton_nano: pos.spent_ton_nano,
         amount_tokens_nano: pos.amount_tokens_nano,
@@ -637,6 +667,11 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
         pnl_pct: pnlPct,
         tp1_hit: pos.tp1_hit,
         migrated,
+        // Sticky time-stop fields (NULL tick updates preserve stored values).
+        max_hold_ms: pos.max_hold_ms,
+        exit_by_ms: pos.exit_by_ms,
+        // Table-level discriminator (sticky via positionRow default "sniper").
+        technique: pos.technique ?? "sniper",
       }));
 
       const state: ExitState = {
@@ -649,6 +684,23 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
         // small lot, so the close decision needs the actual notional.
         positionTon: nanoToTon(pos.spent_ton_nano),
         roundTripGasTon: ROUND_TRIP_GAS_TON,
+        // Phase 5.1 time-stop inputs (recomputed live from entry_at so config
+        // changes take effect on the next tick).
+        entryTimeMs: pos.entry_at,
+        now: Date.now(),
+        maxHoldMs,
+        // Phase 5.1 vol-widened SL facts (corroboration-only for width).
+        realizedVol: volState?.realizedVol ?? undefined,
+        baseRealizedVol: volState?.baseRealizedVol ?? undefined,
+        slVolWidenMaxPct: CONFIG.sniper.slVolWidenEnabled ? CONFIG.sniper.slVolWidenMaxPct : undefined,
+        // §2.2 peak-giveback trail. The peak is monotonic (ratcheted upward
+        // only at line 570) and the config ships OFF — behaviour-neutral.
+        // Fields are present only when the feature is wired in, so legacy
+        // callers of decideExit (and tests) see an unchanged decision path.
+        peakPriceTon: peak,
+        givebackEnabled: CONFIG.sniper.givebackEnabled,
+        givebackArmPct: CONFIG.sniper.givebackArmPct,
+        givebackDropPct: CONFIG.sniper.givebackDropPct,
       };
       const decision = decideExit(state);
       if (decision.action === "hold") continue;
@@ -688,7 +740,7 @@ export async function monitorTick(kp: KeyPair | null): Promise<{ checked: number
  */
 export async function sellToken(id: string, kp: KeyPair, action: string, reason: string, expectedOutTon?: number, fraction = 1): Promise<boolean> {
   const pos = sniperPositionStore.get(id);
-  if (!pos) return false;
+  if (!pos || pos.status === "CLOSED") return false;
   const heldNano = BigInt(pos.amount_tokens_nano);
   const isPartial = fraction > 0 && fraction < 1;
   const tokensNano = isPartial

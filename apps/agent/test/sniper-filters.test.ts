@@ -21,6 +21,7 @@ import assert from "node:assert/strict";
 import {
   decideExit,
   confirmedByFeeds,
+  effectiveStopPct,
   netProceedsTon,
   mergeFill,
   positionSizeTon,
@@ -118,6 +119,124 @@ test("decideExit: -34.99% (above stop) → hold", () => {
   const s = state({ currentPriceTon: 0.0006501 });
   const d = decideExit(s);
   assert.equal(d.action, "hold");
+});
+
+// ── decideExit: §2.2 peak-giveback trail (2026-08-11) ──────────────────
+// Profit-armed, full-exit trail. Precedence: trend → giveback → time → stop.
+// Invariants (§2.4): profit-armed only, never loss-side (net-breakeven
+// clamp), full exit, monotonic peak, disabled by default.
+
+test("givebackExit: fires on giveback threshold with pnl > 0", () => {
+  const s = state({
+    entryPriceTon: 0.001,
+    currentPriceTon: 0.0014, // peak 0.002, now +40%
+    peakPriceTon: 0.002,
+    givebackEnabled: true,
+    givebackArmPct: 10,
+    givebackDropPct: 20,
+  });
+  // peak 0.002 × (1 − 0.2) = 0.0016; 0.0014 ≤ 0.0016 → fires, pnl +40%.
+  const d = decideExit(s);
+  assert.equal(d.action, "giveback_exit");
+  assert.match(d.reason, /giveback/);
+  assert.match(d.reason, /pnl 40\.0%/);
+});
+
+test("givebackExit: silent below the arm (profit-armed invariant 1)", () => {
+  // arm level = entry × 1.10 = 0.0011. Peak 0.00105 (+5%) is BELOW the arm,
+  // so the trail never arms — even though the price gave back 21% from the
+  // peak and sits below entry (−17.5%). Invariant 1: below the arm the trail
+  // does not exist.
+  const s = state({
+    entryPriceTon: 0.001,
+    currentPriceTon: 0.000825,
+    peakPriceTon: 0.00105,
+    givebackEnabled: true,
+    givebackArmPct: 10,
+    givebackDropPct: 20,
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "hold"); // −17.5% > −35% stop → plain hold
+});
+
+test("givebackExit: clamp prevents loss-side exit (invariant 2)", () => {
+  // Small lot (0.5 TON) with flat 0.2 TON round-trip gas: net breakeven is
+  // entry × (1 + 0.2/0.5) = 0.001 × 1.4 = 0.0014. The raw giveback level
+  // (peak 0.002 × 0.6 = 0.0012) would cross below entry — the net-breakeven
+  // clamp lifts it to 0.0014, so a close at 0.00135 still exits in profit
+  // (+35%), never below net breakeven.
+  const s = state({
+    entryPriceTon: 0.001,
+    currentPriceTon: 0.00135, // +35%
+    peakPriceTon: 0.002, // peak +100%
+    givebackEnabled: true,
+    givebackArmPct: 10,
+    givebackDropPct: 40, // raw level 0.002 × 0.6 = 0.0012 < 0.0014 clamp
+    positionTon: 0.5,
+    roundTripGasTon: 0.2,
+  });
+  const d = decideExit(s);
+  // The level clamps to net breakeven 0.0014; current 0.00135 ≤ 0.0014 → still
+  // fires, but at a PROFIT (+35%) because the clamp lifted the level above the
+  // raw giveback. The key invariant: never fires below net breakeven.
+  assert.equal(d.action, "giveback_exit");
+  assert.match(d.reason, /pnl 35\.0%/);
+});
+
+test("givebackExit: current above the giveback level → hold", () => {
+  const s = state({
+    entryPriceTon: 0.001,
+    currentPriceTon: 0.0018, // +80%
+    peakPriceTon: 0.002,
+    givebackEnabled: true,
+    givebackArmPct: 10,
+    givebackDropPct: 20, // level 0.0016; 0.0018 > 0.0016 → hold
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "hold");
+});
+
+test("givebackExit: disabled (default) → no-op, hold", () => {
+  const s = state({
+    currentPriceTon: 0.0014,
+    peakPriceTon: 0.002,
+    // givebackEnabled absent → OFF per §2.5
+    givebackArmPct: 10,
+    givebackDropPct: 20,
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "hold");
+});
+
+test("decideExit: trend flip outranks giveback on the same tick (precedence)", () => {
+  // Both fire: confirmed downtrend flip AND the price gave back past the
+  // giveback level. The doc mandates trend → giveback → time → stop.
+  const s = state({
+    entryPriceTon: 0.001,
+    currentPriceTon: 0.0014, // +40%
+    peakPriceTon: 0.002,
+    givebackEnabled: true,
+    givebackArmPct: 10,
+    givebackDropPct: 20, // level 0.0016; 0.0014 ≤ 0.0016 → giveback would fire
+    trendBearish: true,
+    trendReason: "fast EMA < slow EMA (3 confirmed ticks)",
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "trend_exit");
+  assert.match(d.reason, /trend flipped to downtrend/);
+});
+
+test("givebackExit: peak below entry with enabled trail → silent (never arms on a loss)", () => {
+  const s = state({
+    entryPriceTon: 0.001,
+    currentPriceTon: 0.0008, // −20%
+    peakPriceTon: 0.0009, // peak itself below entry
+    givebackEnabled: true,
+    givebackArmPct: 10,
+    givebackDropPct: 20,
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "hold"); // not even the stop: −20% > −35%
 });
 
 // ── netProceedsTon ────────────────────────────────────────────────────────
@@ -399,4 +518,70 @@ test("softScore: score is clamped to 0..100", () => {
     ctx,
   );
   assert.ok(maxed >= 0 && maxed <= 100, `got ${maxed}`);
+});
+
+// ── effectiveStopPct: Phase 5.1 vol-widened SL ───────────────────────────
+
+test("effectiveStopPct: returns static stop when vol data absent", () => {
+  assert.equal(effectiveStopPct(35), 35);
+  assert.equal(effectiveStopPct(35, undefined, undefined), 35);
+  assert.equal(effectiveStopPct(35, NaN, 10), 35);
+  assert.equal(effectiveStopPct(35, 10, NaN), 35);
+});
+
+test("effectiveStopPct: returns static stop when vol is NOT elevated", () => {
+  // realizedVol <= baseRealizedVol → no widening.
+  assert.equal(effectiveStopPct(35, 10, 10), 35);
+  assert.equal(effectiveStopPct(35, 5, 10), 35);
+});
+
+test("effectiveStopPct: widens loss-side when vol is elevated AND a cap > base is set", () => {
+  // Fail-closed: without an explicit cap the widened width clamps to the
+  // static base (widening is config-gated — never wider than configured).
+  assert.equal(effectiveStopPct(35, 20, 10), 35);
+  assert.equal(effectiveStopPct(35, 20, 10, 80), 70); // 2× baseline → 2× width
+  assert.equal(effectiveStopPct(35, 15, 10, 80), 52.5); // 1.5× baseline
+});
+
+test("effectiveStopPct: clamps to slVolWidenMaxPct cap", () => {
+  // 4× vol → raw 140%, but the cap holds at 50%.
+  assert.equal(effectiveStopPct(35, 40, 10, 50), 50);
+  // Cap below the static base is ignored (floor is static width).
+  assert.equal(effectiveStopPct(35, 40, 10, 20), 35);
+});
+
+test("effectiveStopPct: base floor is absolute (negative stopLossPct ok)", () => {
+  // The static key is signed (+35/-35) — the effective width must be positive.
+  // Without an explicit cap the widened width is bounded by the static base
+  // (cap defaults to base), so a negative stopLossPct still yields a positive,
+  // static-bounded result — never a loss-side exit wider than the cap allows.
+  assert.equal(effectiveStopPct(-35, 20, 10), 35);
+  // With an explicit cap, the widened width applies and stays positive.
+  assert.equal(effectiveStopPct(-35, 20, 10, 80), 70);
+});
+
+test("decideExit: vol-widened stop fires at the widened level, not the static", () => {
+  // Static stop −35%. 2× vol → widened −70%. A −40% pnl must still HOLD
+  // (above the widened stop) but would have fired the static stop.
+  const s = state({
+    currentPriceTon: 0.0006, // −40%
+    realizedVol: 20,
+    baseRealizedVol: 10,
+    slVolWidenMaxPct: 80,
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "hold");
+});
+
+test("decideExit: vol-widened stop still fires at the widened level", () => {
+  // −40% is within the widened −70% stop; a −75% pnl clears it.
+  const s = state({
+    currentPriceTon: 0.00025, // −75%
+    realizedVol: 20,
+    baseRealizedVol: 10,
+    slVolWidenMaxPct: 80,
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "stop_loss");
+  assert.match(d.reason, /vol-widened to 70%/);
 });

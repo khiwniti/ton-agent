@@ -362,3 +362,199 @@ test("pnl calculation matches spec", () => {
   const decision2 = evaluateExitPolicy(pos, ctx2);
   assert.equal(decision2?.trigger, "stop_loss"); // -20% < -15%
 });
+
+// ── Phase 4.5: structure stop (close-confirmation SL) ─────────────────────
+// level = highWater − k×ATR, clamped above the static % floor. Fires ONLY
+// after `stopConfirmTicks` CONSECUTIVE closes beyond the level — a single
+// wick/intrabar excursion does not stop the position out.
+
+test("structure stop: fires only after stopConfirmTicks consecutive closes beyond the level", () => {
+  const ctx = context({
+    currentPriceUsd: 90, // mark below the level (say 92) but pnl above -15%
+    entryPriceUsd: 100,
+    structureStop: { levelTon: 92, confirmedTicks: 1 },
+    stopConfirmTicks: 2,
+  });
+  const pos = position();
+  // confirmedTicks 1 < 2 → no fire, even though the mark is beyond the level.
+  assert.equal(evaluateExitPolicy(pos, ctx), null);
+  // second consecutive close beyond the level → fires.
+  const ctx2 = { ...ctx, structureStop: { levelTon: 92, confirmedTicks: 2 } };
+  const decision = evaluateExitPolicy(pos, ctx2);
+  assert.ok(decision);
+  assert.equal(decision.trigger, "stop_loss");
+  assert.equal(decision.nextStatus, "STOPPED");
+  assert.match(decision.reason, /structure break/);
+});
+
+test("structure stop: mark above the level → no fire regardless of ticks", () => {
+  const ctx = context({
+    currentPriceUsd: 95, // above level 92
+    entryPriceUsd: 100,
+    structureStop: { levelTon: 92, confirmedTicks: 5 },
+    stopConfirmTicks: 2,
+  });
+  const pos = position();
+  assert.equal(evaluateExitPolicy(pos, ctx), null);
+});
+
+test("structure stop: static % floor still fires immediately (no confirmation needed)", () => {
+  // pnl -20% <= -15% floor → fires stop_loss with the static reason, even
+  // though the structure stop has only 1/2 confirmations.
+  const ctx = context({
+    currentPriceUsd: 80,
+    entryPriceUsd: 100,
+    structureStop: { levelTon: 92, confirmedTicks: 1 },
+    stopConfirmTicks: 2,
+  });
+  const pos = position();
+  const decision = evaluateExitPolicy(pos, ctx);
+  assert.ok(decision);
+  assert.equal(decision.trigger, "stop_loss");
+  assert.match(decision.reason, /stop loss: pnl/); // static reason, not structure
+});
+
+test("structure stop: absent stopConfirmTicks → inert (no structure stop fires)", () => {
+  const ctx = context({
+    currentPriceUsd: 88, // below structure level 92, but above the static floor 85
+    entryPriceUsd: 100,
+    structureStop: { levelTon: 92, confirmedTicks: 5 },
+    // stopConfirmTicks undefined → engine defaults to 0 → guard fails.
+  });
+  const pos = position();
+  assert.equal(evaluateExitPolicy(pos, ctx), null);
+});
+
+test("structure stop: null levelTon → no structure stop (static line only)", () => {
+  const ctx = context({
+    currentPriceUsd: 88,
+    entryPriceUsd: 100,
+    structureStop: { levelTon: null, confirmedTicks: 5 },
+    stopConfirmTicks: 2,
+  });
+  const pos = position();
+  assert.equal(evaluateExitPolicy(pos, ctx), null); // -12% > -15%, no structure
+});
+
+test("structure stop: absent structureStop entirely → backward-compatible null", () => {
+  const ctx = context({
+    currentPriceUsd: 88,
+    entryPriceUsd: 100,
+    stopConfirmTicks: 2,
+  });
+  const pos = position();
+  assert.equal(evaluateExitPolicy(pos, ctx), null);
+});
+
+// ── Phase 4.5: SPIKED-regime extra trend-exit confirmation cost ───────────
+// In a SPIKED regime, single-tick noise passes a fixed confirmation counter
+// faster. When the engine knows both the base tick count and the extra cost,
+// a bearish flip needs `trendConfirmTicks + trendExitSpikedExtraTicks`
+// confirmations before trend_exit fires. CALM/NORMAL keeps configured ticks.
+
+test("SPIKED: bearish below the raised threshold → no trend_exit yet", () => {
+  const ctx = context({
+    currentPriceUsd: 125,
+    entryPriceUsd: 100,
+    trendSignal: { bearish: true, confirmations: 3, reason: "flip" },
+    volatility: { atrCloseTon: 0.05, regime: "spiked", realizedVol: 0.4 },
+    trendConfirmTicks: 3,
+    trendExitSpikedExtraTicks: 2, // needs 3 + 2 = 5
+  });
+  const pos = position();
+  assert.equal(evaluateExitPolicy(pos, ctx), null);
+});
+
+test("SPIKED: bearish at the raised threshold → trend_exit fires", () => {
+  const ctx = context({
+    currentPriceUsd: 125,
+    entryPriceUsd: 100,
+    trendSignal: { bearish: true, confirmations: 5, reason: "flip" },
+    volatility: { atrCloseTon: 0.05, regime: "spiked", realizedVol: 0.4 },
+    trendConfirmTicks: 3,
+    trendExitSpikedExtraTicks: 2,
+  });
+  const pos = position();
+  const decision = evaluateExitPolicy(pos, ctx);
+  assert.ok(decision);
+  assert.equal(decision.trigger, "trend_exit");
+  assert.match(decision.reason, /SPIKED vol/);
+});
+
+test("NORMAL regime: bearish at configured ticks fires immediately", () => {
+  const ctx = context({
+    currentPriceUsd: 125,
+    entryPriceUsd: 100,
+    trendSignal: { bearish: true, confirmations: 3, reason: "flip" },
+    volatility: { atrCloseTon: 0.05, regime: "normal", realizedVol: 0.1 },
+    trendConfirmTicks: 3,
+    trendExitSpikedExtraTicks: 2,
+  });
+  const pos = position();
+  const decision = evaluateExitPolicy(pos, ctx);
+  assert.ok(decision);
+  assert.equal(decision.trigger, "trend_exit");
+  assert.ok(!/SPIKED/.test(decision.reason));
+});
+
+test("absent volatility facts → SPIKED gate skipped (plain bearish fires)", () => {
+  // Backward compatibility: no volatility/trendConfirmTicks/extra → the
+  // pre-4.5 behavior — a confirmed bearish flip fires trend_exit.
+  const ctx = context({
+    currentPriceUsd: 125,
+    entryPriceUsd: 100,
+    trendSignal: { bearish: true, reason: "flip" },
+  });
+  const pos = position();
+  const decision = evaluateExitPolicy(pos, ctx);
+  assert.ok(decision);
+  assert.equal(decision.trigger, "trend_exit");
+});
+
+test("SPIKED regime without extra-tick config → plain bearish fires (no gate)", () => {
+  // regime says spiked but the engine lacks the extra-cost facts → the
+  // SPIKED gate is skipped entirely, matching pre-4.5 behavior.
+  const ctx = context({
+    currentPriceUsd: 125,
+    entryPriceUsd: 100,
+    trendSignal: { bearish: true, confirmations: 3, reason: "flip" },
+    volatility: { atrCloseTon: 0.05, regime: "spiked", realizedVol: 0.4 },
+  });
+  const pos = position();
+  const decision = evaluateExitPolicy(pos, ctx);
+  assert.ok(decision);
+  assert.equal(decision.trigger, "trend_exit");
+});
+
+test("SPIKED: emergency (rug) still outranks the delayed trend exit", () => {
+  const ctx = context({
+    currentPriceUsd: 125,
+    entryPriceUsd: 100,
+    trendSignal: { bearish: true, confirmations: 3, reason: "flip" },
+    volatility: { atrCloseTon: 0.05, regime: "spiked", realizedVol: 0.4 },
+    trendConfirmTicks: 3,
+    trendExitSpikedExtraTicks: 2,
+    rugSignal: { rugged: true, reason: "liquidity drain" },
+  });
+  const pos = position();
+  const decision = evaluateExitPolicy(pos, ctx);
+  assert.equal(decision?.trigger, "emergency_exit");
+});
+
+// ── Phase 4.5: structure stop vs trend exit priority ───────────────────────
+
+test("structure stop: trend_exit outranks a half-confirmed structure stop", () => {
+  // bearish flip (would trend_exit) while the structure stop is only 1/2
+  // confirmed → trend wins (it appears earlier in the priority order).
+  const ctx = context({
+    currentPriceUsd: 90,
+    entryPriceUsd: 100,
+    trendSignal: { bearish: true, confirmations: 3, reason: "flip" },
+    structureStop: { levelTon: 92, confirmedTicks: 1 },
+    stopConfirmTicks: 2,
+  });
+  const pos = position();
+  const decision = evaluateExitPolicy(pos, ctx);
+  assert.equal(decision?.trigger, "trend_exit");
+});
+

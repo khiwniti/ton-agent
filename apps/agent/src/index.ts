@@ -56,7 +56,6 @@ async function main() {
     const REQUIRED_VARS = [
       "AGENT_SHARED_SECRET",
       "NVIDIA_API_KEY",
-      "TONAPI_KEY",
       "PUBLIC_WEBHOOK_URL",
     ] as const;
 
@@ -66,6 +65,13 @@ async function main() {
         console.error(`FATAL: Missing or empty required environment variable: ${k}`);
       }
       process.exit(1);
+    }
+
+    // TONAPI is an optional enrichment layer (holders count, jetton meta fallback).
+    // The agent boots and trades fine without it — primary data plane is
+    // on-chain TonClient + DEX REST (x1000, DeDust, StonFi pools).
+    if (!CONFIG.tonapiKey) {
+      log.warn("BOOT", "TONAPI_KEY not set — TONAPI-backed enrichment (holders count, meta fallback) disabled; on-chain + DEX REST data plane remains active.");
     }
 
     log.banner(

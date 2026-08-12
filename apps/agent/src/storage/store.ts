@@ -56,7 +56,11 @@ db.exec(`
     trend_observations INTEGER NOT NULL DEFAULT 0,
     trend_reason TEXT,
     trend_updated_at INTEGER,
-    feed_confirmed INTEGER NOT NULL DEFAULT 0
+    feed_confirmed INTEGER NOT NULL DEFAULT 0,
+    -- Provenance discriminator (2026-08-11): "swing" | "sniper" | NULL.
+    -- Recorded at open; nothing gates on it yet — it feeds per-technique
+    -- reporting and the technique exit matrix (research/05-technique-exit-matrix.md).
+    technique TEXT
   );
 
   CREATE TABLE IF NOT EXISTS seen_jettons (
@@ -178,6 +182,12 @@ const POSITION_MIGRATIONS: Array<[string, string]> = [
   ["trend_reason", "TEXT"],
   ["trend_updated_at", "INTEGER"],
   ["feed_confirmed", "INTEGER NOT NULL DEFAULT 0"],
+  // Volatility- & structure-adaptive exits (2026-08-11) — journaled facts
+  // so the dashboard can surface regime. NULL when the module is disabled.
+  ["atr_close_ton", "REAL"],
+  ["volatility_regime", "TEXT"],
+  ["structure_stop_level_ton", "REAL"],
+  ["technique", "TEXT"],
 ];
 for (const [col, type] of POSITION_MIGRATIONS) {
   try {
@@ -227,6 +237,12 @@ export interface DbPosition {
   trend_reason?: string | null;
   trend_updated_at?: number | null;
   feed_confirmed?: number; // 1 = external feeds corroborated the flip
+  // Phase 4.5 volatility-adaptive exit state (written every tick while OPEN)
+  atr_close_ton?: number | null; // close-only ATR proxy (price units)
+  volatility_regime?: string | null; // calm | normal | spiked | unknown
+  structure_stop_level_ton?: number | null; // high-water − k×ATR, clamped
+  // Provenance discriminator (2026-08-11): "swing" | "sniper" | null.
+  technique?: string | null;
 }
 
 // Positions API
@@ -268,6 +284,11 @@ export const positionsStore = {
       trend_reason: null,
       trend_updated_at: null,
       feed_confirmed: 0,
+      // Phase 4.5 volatility facts — overwritten every tick like trend state.
+      atr_close_ton: null,
+      volatility_regime: null,
+      structure_stop_level_ton: null,
+      technique: null, // "swing" | "sniper" set at open; sticky thereafter
       ...p,
     };
     const    stmt = db.prepare(`
@@ -280,14 +301,18 @@ export const positionsStore = {
         -- position's time limit was dropped on INSERT: max_hold_ms/exit_by_ms
         -- landed NULL and the TimeExit rule never fired for it.
         max_hold_ms, exit_by_ms, rugged, rugged_at, emergency_exit, gas_ton,
-        trend_bearish, trend_confirmations, trend_observations, trend_reason, trend_updated_at, feed_confirmed
+        trend_bearish, trend_confirmations, trend_observations, trend_reason, trend_updated_at, feed_confirmed,
+        atr_close_ton, volatility_regime, structure_stop_level_ton,
+        technique
       ) VALUES (
         @id, @wallet_tier, @jetton_master, @symbol, @dex, @entry_tx_hash,
         @entry_price_ton, @entry_price_usd, @entry_at, @amount_tokens, @cost_basis_ton,
         COALESCE(@confidence_score, 0),
         @current_price_ton, @pnl_pct, @realized_pnl_ton, @status, @take_profit_t1_tx, @close_tx, @close_at,
         @max_hold_ms, @exit_by_ms, COALESCE(@rugged, 0), @rugged_at, COALESCE(@emergency_exit, 0), COALESCE(@gas_ton, 0),
-        @trend_bearish, @trend_confirmations, @trend_observations, @trend_reason, @trend_updated_at, @feed_confirmed
+        @trend_bearish, @trend_confirmations, @trend_observations, @trend_reason, @trend_updated_at, @feed_confirmed,
+        @atr_close_ton, @volatility_regime, @structure_stop_level_ton,
+        @technique
       ) ON CONFLICT(id) DO UPDATE SET
         wallet_tier=excluded.wallet_tier,
         symbol=COALESCE(excluded.symbol, symbol),
@@ -318,7 +343,14 @@ export const positionsStore = {
         trend_observations=excluded.trend_observations,
         trend_reason=excluded.trend_reason,
         trend_updated_at=excluded.trend_updated_at,
-        feed_confirmed=excluded.feed_confirmed
+        feed_confirmed=excluded.feed_confirmed,
+        -- Phase 4.5 volatility facts overwritten every tick like trend state.
+        atr_close_ton=excluded.atr_close_ton,
+        volatility_regime=excluded.volatility_regime,
+        structure_stop_level_ton=excluded.structure_stop_level_ton,
+        -- Sticky: set at open, preserved on tick updates (COALESCE with @param
+        -- NULL when the caller omits it — same pattern as max_hold_ms).
+        technique=COALESCE(@technique, technique)
     `);
     stmt.run(row);
   },
@@ -733,7 +765,15 @@ db.exec(`
     close_at INTEGER,
     migrated INTEGER NOT NULL DEFAULT 0,
     curve_pct_at_entry REAL,
-    notes TEXT
+    notes TEXT,
+    /* Hard time-stop (2026-08-11): max_hold_ms 0/NULL = disabled;
+       exit_by_ms = entry_at + max_hold_ms, recomputed at monitor time. */
+    max_hold_ms INTEGER,
+    exit_by_ms INTEGER,
+    /* Technique discriminator (research/05-technique-exit-matrix.md):
+       this table is inherently the SNIPER technique, so the column is
+       always "sniper"; recorded for symmetric reporting with 'positions'. */
+    technique TEXT DEFAULT 'sniper'
   );
 
   CREATE TABLE IF NOT EXISTS sniper_daily (
@@ -742,6 +782,23 @@ db.exec(`
     realized_ton_nano TEXT NOT NULL DEFAULT '0'
   );
 `);
+
+// Phase 5.1 hard time-stop columns — additive migration for existing DBs
+// (mirrors POSITION_MIGRATIONS above; duplicate-column errors swallowed).
+const SNIPER_POSITION_MIGRATIONS: Array<[string, string]> = [
+  ["max_hold_ms", "INTEGER"],
+  ["exit_by_ms", "INTEGER"],
+  ["technique", "TEXT"],
+];
+for (const [col, type] of SNIPER_POSITION_MIGRATIONS) {
+  try {
+    db.exec(`ALTER TABLE sniper_positions ADD COLUMN ${col} ${type}`);
+    log.info("STORE", `migrated sniper_positions table — added ${col} column`);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/duplicate column name/i.test(msg)) throw e;
+  }
+}
 
 export interface DbSniperPosition {
   id: string;
@@ -765,6 +822,11 @@ export interface DbSniperPosition {
   migrated: number;
   curve_pct_at_entry: number | null;
   notes: string | null;
+  // Phase 5.1 hard time-stop (0/NULL = disabled)
+  max_hold_ms?: number | null;
+  exit_by_ms?: number | null;
+  // Always "sniper" for this table (see CREATE TABLE comment).
+  technique?: string | null;
 }
 
 export const sniperPositionStore = {
@@ -774,12 +836,14 @@ export const sniperPositionStore = {
         id, asset, master, symbol, status, entry_tx_hash, entry_at,
         spent_ton_nano, amount_tokens_nano, entry_price_ton, peak_price_ton,
         current_price_ton, pnl_pct, tp1_hit, tp1_tx_hash, close_tx_hash,
-        close_reason, close_at, migrated, curve_pct_at_entry, notes
+        close_reason, close_at, migrated, curve_pct_at_entry, notes,
+        max_hold_ms, exit_by_ms, technique
       ) VALUES (
         @id, @asset, @master, @symbol, @status, @entry_tx_hash, @entry_at,
         @spent_ton_nano, @amount_tokens_nano, @entry_price_ton, @peak_price_ton,
         @current_price_ton, @pnl_pct, @tp1_hit, @tp1_tx_hash, @close_tx_hash,
-        @close_reason, @close_at, @migrated, @curve_pct_at_entry, @notes
+        @close_reason, @close_at, @migrated, @curve_pct_at_entry, @notes,
+        @max_hold_ms, @exit_by_ms, @technique
       )
       ON CONFLICT(id) DO UPDATE SET
         symbol=COALESCE(excluded.symbol, symbol),
@@ -789,8 +853,15 @@ export const sniperPositionStore = {
         amount_tokens_nano=excluded.amount_tokens_nano,
         entry_price_ton=excluded.entry_price_ton,
         peak_price_ton=excluded.peak_price_ton,
-        current_price_ton=excluded.current_price_ton,
-        pnl_pct=excluded.pnl_pct,
+        -- Sticky, like almost every other field in this clause. sellToken()
+        -- omits both, so positionRow() defaults them to NULL; with a bare
+        -- excluded.* that NULL overwrote the last repriced values, and the
+        -- final price and PnL of every CLOSED sniper trade were discarded on
+        -- write (9/9 CLOSED rows in production were NULL while both OPEN rows
+        -- were populated). COALESCE keeps the most recent monitorTick reprice,
+        -- which is the best available proxy for the exit price.
+        current_price_ton=COALESCE(excluded.current_price_ton, current_price_ton),
+        pnl_pct=COALESCE(excluded.pnl_pct, pnl_pct),
         tp1_hit=excluded.tp1_hit,
         tp1_tx_hash=COALESCE(excluded.tp1_tx_hash, tp1_tx_hash),
         close_tx_hash=COALESCE(excluded.close_tx_hash, close_tx_hash),
@@ -798,7 +869,12 @@ export const sniperPositionStore = {
         close_at=COALESCE(excluded.close_at, close_at),
         migrated=excluded.migrated,
         curve_pct_at_entry=COALESCE(excluded.curve_pct_at_entry, curve_pct_at_entry),
-        notes=excluded.notes
+        notes=excluded.notes,
+        -- Phase 5.1 time-stop (sticky: NULL on tick updates preserves stored).
+        max_hold_ms=COALESCE(@max_hold_ms, max_hold_ms),
+        exit_by_ms=COALESCE(@exit_by_ms, exit_by_ms),
+        -- Technique is table-fixed "sniper"; sticky via COALESCE.
+        technique=COALESCE(@technique, technique)
     `).run(p);
   },
 
@@ -806,6 +882,19 @@ export const sniperPositionStore = {
     return db
       .prepare("SELECT * FROM sniper_positions WHERE status = 'OPEN' ORDER BY entry_at ASC")
       .all() as DbSniperPosition[];
+  },
+
+  /**
+   * Masters the engine must never re-buy: any position closed by an operator
+   * handoff ("that coin is mine, leave it alone"). The scan path keys on
+   * master, so this maps to masters — a coin the operator traded manually
+   * stays out of the scan feed even after the handoff row is CLOSED.
+   */
+  handoffMasters(): Set<string> {
+    const rows = db
+      .prepare("SELECT master FROM sniper_positions WHERE close_reason = 'manual_handoff'")
+      .all() as Array<{ master: string }>;
+    return new Set(rows.map((r) => r.master));
   },
 
   get(id: string): DbSniperPosition | undefined {

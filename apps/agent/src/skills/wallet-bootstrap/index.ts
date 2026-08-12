@@ -12,7 +12,6 @@ import { Address, type TonClient } from "@ton/ton";
 import { mnemonicNew } from "@ton/crypto";
 import { CONFIG } from "../../config";
 import { log } from "../../logger";
-import { tonapiGet } from "../../http/tonapi";
 import {
   loadKeyPairForTier,
   makeClient,
@@ -53,7 +52,7 @@ type Output = {
 async function checkDeployStatus(
     client: TonClient,
     address: Address,
-    network: "mainnet" | "testnet",
+    _network: "mainnet" | "testnet",
 ): Promise<Output["deployStatus"]> {
     try {
         const r = await client.getContractState(address);
@@ -63,19 +62,9 @@ async function checkDeployStatus(
         if (s === "uninitialized") return "uninit";
         if (s === "nonexist") return "nonexist";
         return "unknown";
-    } catch {
-        // Fallback to TONAPI on failure (network may be different liteserver).
-        try {
-            const r = await tonapiGet(`/accounts/${address.toString()}`, { timeoutMs: 5000 });
-            const status = r.data?.status as string | undefined;
-            if (status === "active") return "active";
-            if (status === "uninit") return "uninit";
-            if (status === "nonexist") return "nonexist";
-            return "unknown";
-        } catch (e: any) {
-            log.warn("WALLET-BOOT", `deploy status probe failed: ${e.message}`);
-            return "unknown";
-        }
+    } catch (e: any) {
+        log.warn("WALLET-BOOT", `deploy status probe failed: ${e.message}`);
+        return "unknown";
     }
 }
 

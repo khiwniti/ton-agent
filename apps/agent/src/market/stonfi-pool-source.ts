@@ -51,6 +51,21 @@ export class StonFiPoolSource extends BasePoolPriceSource {
     super(config);
   }
 
+  // Pools that returned HTTP 400 (unindexed / migrated to V2) are cached here
+  // for DEAD_POOL_TTL_MS so we skip them without spamming ERR logs every tick.
+  private readonly _deadPools = new Map<string, number>();
+  private readonly DEAD_POOL_TTL_MS = 30 * 60 * 1000; // 30 min
+
+  private _isDead(addr: string): boolean {
+    const ts = this._deadPools.get(addr);
+    if (!ts) return false;
+    if (Date.now() - ts > this.DEAD_POOL_TTL_MS) {
+      this._deadPools.delete(addr); // TTL expired — retry once
+      return false;
+    }
+    return true;
+  }
+
   protected async pollOnce(): Promise<boolean> {
     const pools = this.watchedPools();
     if (pools.length === 0) return true; // nothing to do yet — healthy idle
@@ -59,6 +74,8 @@ export class StonFiPoolSource extends BasePoolPriceSource {
     const assets = await this.fetchAssets();
     let ok = false;
     for (const addr of pools) {
+      // Skip pools that previously returned 400 (unindexed / V2 migrated).
+      if (this._isDead(addr)) continue;
       try {
         const res = await axios.get<StonFiPool>(`${STONFI_API}/v1/pools/${addr}`, {
           timeout: 8000,
@@ -72,8 +89,14 @@ export class StonFiPoolSource extends BasePoolPriceSource {
         }
       } catch (err) {
         const status = (err as AxiosError).response?.status;
-        log.err("MARKET", `STON.fi poll ${addr} failed (${status ?? "net"})`);
-        if (status === 429 || (status ?? 0) >= 500) throw err; // drive backoff
+        if (status === 400) {
+          // Pool is unindexed or migrated — mark dead, log once, then suppress.
+          this._deadPools.set(addr, Date.now());
+          log.warn("MARKET", `STON.fi pool ${addr.slice(0,8)}… returned 400 — marked dead for 30 min`);
+        } else {
+          log.err("MARKET", `STON.fi poll ${addr} failed (${status ?? "net"})`);
+          if (status === 429 || (status ?? 0) >= 500) throw err; // drive backoff
+        }
       }
     }
     return ok;

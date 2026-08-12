@@ -209,3 +209,66 @@ test("historySize shorter than slowEmaPeriod+2 is clamped (signal not disabled)"
   const c = firstConfirmed(t, series);
   assert.ok(c >= 0, "clamped history must still allow a confirmed flip");
 });
+
+// ── 4. Phase 4.5 accessors (highWaterClose / closes) ───────────────────────
+
+test("highWaterClose returns the max of the ring buffer", () => {
+  const t = new TrendTracker();
+  t.observe("p", 100, ENTRY);
+  t.observe("p", 105, ENTRY);
+  t.observe("p", 102, ENTRY);
+  t.observe("p", 110, ENTRY);
+  t.observe("p", 108, ENTRY);
+  assert.equal(t.highWaterClose("p"), 110);
+});
+
+test("highWaterClose returns the seeded entry price before any higher close", () => {
+  const t = new TrendTracker();
+  t.observe("p", 100, ENTRY);
+  t.observe("p", 99, ENTRY);
+  t.observe("p", 98, ENTRY);
+  // seed is ENTRY (100) — nothing has exceeded it yet
+  assert.equal(t.highWaterClose("p"), 100);
+});
+
+test("highWaterClose is null for an unknown key", () => {
+  const t = new TrendTracker();
+  assert.equal(t.highWaterClose("nope"), null);
+});
+
+test("highWaterClose ignores non-finite closes", () => {
+  const t = new TrendTracker();
+  t.observe("p", 100, ENTRY);
+  t.observe("p", 120, ENTRY);
+  t.observe("p", Number.NaN, ENTRY); // data gap — skipped from the buffer
+  assert.equal(t.highWaterClose("p"), 120);
+});
+
+test("closes returns a copy of the live window (seed + real prices)", () => {
+  const t = new TrendTracker();
+  const series = gen(4, 2, 90); // 4 flat @100 then 2 declining
+  for (const c of series) t.observe("p", c, ENTRY);
+  const closes = t.closes("p");
+  // seeded with slowEmaPeriod+2 = 27 copies of ENTRY, then 6 real ticks
+  assert.equal(closes.length, 27 + 6);
+  assert.equal(closes[closes.length - 1], series[series.length - 1]);
+  assert.equal(closes[0], ENTRY); // seed baseline
+  // mutating the returned copy must not affect the tracker
+  closes.push(1);
+  assert.equal(t.closes("p").length, 27 + 6);
+});
+
+test("closes returns [] for an unknown key", () => {
+  const t = new TrendTracker();
+  assert.deepEqual(t.closes("nope"), []);
+});
+
+test("forget() drops the high-water/close state too", () => {
+  const t = new TrendTracker();
+  t.observe("p", 100, ENTRY);
+  t.observe("p", 115, ENTRY);
+  assert.equal(t.highWaterClose("p"), 115);
+  t.forget("p");
+  assert.equal(t.highWaterClose("p"), null);
+  assert.deepEqual(t.closes("p"), []);
+});

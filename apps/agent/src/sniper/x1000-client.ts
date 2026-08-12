@@ -23,6 +23,7 @@ import axios, { AxiosError } from "axios";
 import { Cell, Address } from "@ton/ton";
 import { log } from "../logger";
 import { CONFIG } from "../config";
+import { acquireDeDustSlot, releaseDeDustSlot } from "../http/rate-limit";
 
 export const DEDUST_API =
   (process.env.DEDUST_API_BASE || "https://mainnet.api.dedust.io").replace(/\/$/, "");
@@ -136,45 +137,66 @@ const http = axios.create({ timeout: 12_000 });
 
 async function post<T>(path: string, body: unknown): Promise<T> {
   const url = `${DEDUST_API}${path}`;
-  let attempt = 0;
-  for (;;) {
-    try {
-      const r = await http.post<T>(url, body, {
-        headers: { "Content-Type": "application/json" },
-      });
-      return r.data;
-    } catch (e: unknown) {
-      const err = e as { response?: { status?: number; data?: unknown }; message?: string };
-      const status = err?.response?.status;
-      if (status === 429 || !status || status >= 500) {
-        if (attempt >= 4) throw new Error(`dedust ${path} failed after retries: ${err?.message}`);
-        attempt += 1;
-        const backoff = Math.min(60_000, 1_000 * 2 ** attempt) + Math.random() * 1_000;
-        const { promise, resolve } = Promise.withResolvers<void>();
-        setTimeout(resolve, backoff);
-        await promise;
-        continue;
+  // Funnel every DeDust request through the shared rate-limit bucket so the
+  // five concurrent callers (sniper scan, sniper monitor, position monitor,
+  // coordinator balance refresh, webhook) cannot stampede each other into a
+  // 429 storm. `finally` releases the slot even when the retry loop throws,
+  // so a single bad call cannot starve every other subsystem.
+  await acquireDeDustSlot();
+  try {
+    let attempt = 0;
+    for (;;) {
+      try {
+        const r = await http.post<T>(url, body, {
+          headers: { "Content-Type": "application/json" },
+        });
+        return r.data;
+      } catch (e: unknown) {
+        const err = e as { response?: { status?: number; data?: unknown }; message?: string };
+        const status = err?.response?.status;
+        if (status === 429 || !status || status >= 500) {
+          if (attempt >= 4) throw new Error(`dedust ${path} failed after retries: ${err?.message}`);
+          attempt += 1;
+          const backoff = Math.min(60_000, 1_000 * 2 ** attempt) + Math.random() * 1_000;
+          const { promise, resolve } = Promise.withResolvers<void>();
+          setTimeout(resolve, backoff);
+          await promise;
+          continue;
+        }
+        throw new Error(`dedust ${path} ${status}: ${JSON.stringify(err?.response?.data ?? err?.message).slice(0, 300)}`);
       }
-      throw new Error(`dedust ${path} ${status}: ${JSON.stringify(err?.response?.data ?? err?.message).slice(0, 300)}`);
     }
+  } finally {
+    releaseDeDustSlot();
   }
 }
 
 async function get<T>(path: string, params?: Record<string, unknown>): Promise<T> {
   const url = `${DEDUST_API}${path}`;
+  await acquireDeDustSlot();
   try {
-    const r = await http.get<T>(url, { params });
-    return r.data;
-  } catch (e: unknown) {
-    const err = e as { response?: { status?: number; data?: unknown }; message?: string };
-    const status = err?.response?.status;
-    if (status === 429 || !status || status >= 500) {
-      const { promise, resolve } = Promise.withResolvers<void>();
-      setTimeout(resolve, 2_000 + Math.random() * 1_000);
-      await promise;
-      return (await http.get<T>(url, { params })).data;
+    let attempt = 0;
+    for (;;) {
+      try {
+        const r = await http.get<T>(url, { params });
+        return r.data;
+      } catch (e: unknown) {
+        const err = e as { response?: { status?: number; data?: unknown }; message?: string };
+        const status = err?.response?.status;
+        if (status === 429 || !status || status >= 500) {
+          if (attempt >= 4) throw new Error(`dedust GET ${path} failed after retries: ${err?.message}`);
+          attempt += 1;
+          const backoff = Math.min(30_000, 1_000 * 2 ** attempt) + Math.random() * 500;
+          const { promise, resolve } = Promise.withResolvers<void>();
+          setTimeout(resolve, backoff);
+          await promise;
+          continue;
+        }
+        throw new Error(`dedust GET ${path} ${status}: ${JSON.stringify(err?.response?.data ?? err?.message).slice(0, 300)}`);
+      }
     }
-    throw new Error(`dedust GET ${path} ${status}: ${JSON.stringify(err?.response?.data ?? err?.message).slice(0, 300)}`);
+  } finally {
+    releaseDeDustSlot();
   }
 }
 

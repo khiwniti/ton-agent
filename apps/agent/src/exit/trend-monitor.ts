@@ -207,6 +207,29 @@ export class TrendTracker {
     };
   }
 
+  /**
+   * Highest close seen for `key` since entry (high-water mark), or null when
+   * the key has no series yet. Feeds the structure stop
+   * (`structureStopLevel` in exit/volatility-regime.ts).
+   */
+  highWaterClose(key: string): number | null {
+    const buf = this.series.get(key);
+    if (!buf || buf.length === 0) return null;
+    let max = -Infinity;
+    for (const c of buf) if (Number.isFinite(c) && c > max) max = c;
+    return Number.isFinite(max) ? max : null;
+  }
+
+  /**
+   * Copy of the live close window for `key` (the ring buffer, seed prices
+   * included), or [] when absent. Feed it to `atrClose`/`realizedVol` in
+   * exit/volatility-regime.ts — it IS the per-position volatility window.
+   */
+  closes(key: string): number[] {
+    const buf = this.series.get(key);
+    return buf ? [...buf] : [];
+  }
+
   /** Drop per-position state once the position is closed. */
   forget(key: string): void {
     this.series.delete(key);

@@ -51,7 +51,7 @@ import { makeClient } from "../wallet/wallet";
 import { log } from "../logger";
 import { CONFIG } from "../config";
 import { getJetton, fullAuditDetail } from "../security/audit";
-import { getSwapQuote, type Dex } from "../dex/router";
+import { getSwapQuote, readUserJettonBalance, type Dex } from "../dex/router";
 import { resolvePool } from "../security/pool-resolver";
 import { Address, fromNano, toNano } from "@ton/ton";
 import {
@@ -82,13 +82,19 @@ import {
   type TrendSignal,
 } from "../exit/trend-monitor";
 import {
+  atrClose,
+  realizedVol,
+  structureStopLevel,
+  RegimeClassifier,
+} from "../exit/volatility-regime";
+import {
   computeRealizedPnlTon,
   effectiveStopLossPct,
   exitGasTon,
 } from "../economics/trade-economics";
 import { runMonitor as runLegacyMonitor } from "../wallet/position-manager";
 import { SELL_GAS_FLOOR_TON } from "../dex/swap-gas-guard";
-import { tonapiGet } from "../http/tonapi";
+import { fetchHoldersTotal } from "../http/tonapi";
 import { confirmedByFeeds, type ExitConfirmation } from "../sniper/filters";
 import { fetchCoin, masterToAsset } from "../sniper/x1000-client";
 import { fetchTradesWindow } from "../hotpath/dedust-trades";
@@ -285,30 +291,44 @@ const trendDisabled: TrendSignal = {
 };
 
 /**
+ * Per-position volatility regime classifiers (Phase 4.5). Each pool has its
+ * own noise floor — SPIKED means "much noisier than THIS pool's recent
+ * history" — so the classifier (and its EMA baseline) cannot be shared across
+ * positions. Keyed by position id; dropped in `forgetPosition`.
+ */
+const regimeClassifiers = new Map<string, RegimeClassifier>();
+
+/**
+ * Consecutive closes below the structure-stop level, keyed by position id.
+ * Close-confirmation SL (spec): the stop fires only after `stopConfirmTicks`
+ * consecutive closes beyond the ATR band — never on a single wick/intrabar
+ * excursion. Reset in `forgetPosition`.
+ */
+const structureBreakStreaks = new Map<string, number>();
+
+/** Build the per-position regime classifier from CONFIG. */
+function makeRegimeClassifier(): RegimeClassifier {
+  return new RegimeClassifier({
+    period: CONFIG.strategy.volatilityLookback,
+    spikeThreshold: CONFIG.strategy.volatilitySpikeThreshold,
+    calmRatio: CONFIG.strategy.volatilityCalmRatio,
+    confirmTicks: CONFIG.strategy.volatilityConfirmTicks,
+  });
+}
+
+/**
  * Baseline holder count captured on the first CONFIRMED trend tick, keyed by
  * position id. A later flip is checked against a shrinking holder count.
  */
 const holdersBaseline = new Map<string, number>();
-
-/**
- * TONAPI holder total, or `null` when the API is unreachable or the finite
- * check fails.
- */
-async function fetchHoldersTotal(master: string): Promise<number | null> {
-  try {
-    const r = await tonapiGet(`/v2/jettons/${master}/holders`, { timeoutMs: 8000 });
-    const total = r?.total;
-    return Number.isFinite(total) ? total : null;
-  } catch {
-    return null;
-  }
-}
 
 /** Drop all per-position state once a position reaches a terminal status. */
 function forgetPosition(positionId: string, master: string): void {
   exitValueTracker.forget(positionId);
   quoteFailures.delete(positionId);
   trendTracker.forget(positionId);
+  regimeClassifiers.delete(positionId);
+  structureBreakStreaks.delete(positionId);
   holdersBaseline.delete(positionId);
   auditCache.delete(master);
   auditBaselines.delete(master);
@@ -650,12 +670,63 @@ export async function runMonitor() {
             )
           : trendDisabled;
 
+        // ── Volatility- & structure-adaptive facts (Phase 4.5) ─────────────
+        // Computed on the SAME normalized price basis as the engine
+        // (entry=1.0, mark = 1 + pnl/100), so the structure-stop level is
+        // directly comparable to `currentPriceUsd`. The trend tracker's series
+        // is `entry_price_ton * (1 + pnl/100)`, so dividing by the entry price
+        // recovers the normalized mark exactly. Absent facts → engine behaves
+        // exactly as pre-4.5. The per-position window is the tracker's ring
+        // buffer (`closes()`), always ≥ slow-EMA warm-up in length — the exact
+        // pool the ATR proxy is defined over.
+        let volatilityCtx: ExitPolicyContext["volatility"] = null;
+        let structureStopCtx: ExitPolicyContext["structureStop"] = null;
+        let stopConfirmTicksCtx: number | undefined = undefined;
+        if (CONFIG.strategy.volatilityRegimeEnabled && p.entry_price_ton > 0) {
+          const closes = trendTracker.closes(p.id);
+          const normCloses = closes.map((c) => c / p.entry_price_ton);
+          const normHw =
+            trendTracker.highWaterClose(p.id) != null
+              ? (trendTracker.highWaterClose(p.id) as number) / p.entry_price_ton
+              : null;
+          const atr = atrClose(normCloses, CONFIG.strategy.volatilityLookback);
+          let rc = regimeClassifiers.get(p.id);
+          if (!rc) {
+            rc = makeRegimeClassifier();
+            regimeClassifiers.set(p.id, rc);
+          }
+          const regime = rc.observe(normCloses);
+          volatilityCtx = {
+            atrCloseTon: Number.isFinite(atr) ? atr : null,
+            regime,
+            realizedVol: Number.isFinite(atr) ? realizedVol(normCloses) : null,
+          };
+          if (normHw != null && Number.isFinite(atr) && atr > 0) {
+            const level = structureStopLevel(
+              normHw,
+              1, // entry baseline on the normalized scale
+              atr,
+              CONFIG.strategy.stopAtrMult,
+              cfg.stopLossPct, // clamp floor = the configured hard % line
+            );
+            if (level != null && Number.isFinite(level)) {
+              const mark = 1 + pnl / 100;
+              const streak = mark <= level ? (structureBreakStreaks.get(p.id) ?? 0) + 1 : 0;
+              structureBreakStreaks.set(p.id, streak);
+              structureStopCtx = { levelTon: level, confirmedTicks: streak };
+            }
+          } else {
+            structureBreakStreaks.set(p.id, 0);
+          }
+          stopConfirmTicksCtx = CONFIG.strategy.stopConfirmTicks;
+        }
+
         // ── Feed corroboration gate (operator directive 2026-08-09) ──────────
         // A CONFIRMED trend flip must be corroborated by live feeds before it
         // can close a position. Fail-closed: any feed error / missing data →
         // gate = false → hold. Gate is configurable via sniper.trendExitConfirmEnabled.
         let feedConfirmed = 0;
-        let trendSignal: { bearish: boolean; reason?: string } | null = null;
+        let trendSignal: { bearish: boolean; confirmations?: number; reason?: string } | null = null;
         if (trend.confirmed && CONFIG.sniper?.trendExitConfirmEnabled) {
           // Capture holders baseline on first confirmed trend tick
           if (!holdersBaseline.has(p.id)) {
@@ -689,11 +760,19 @@ export async function runMonitor() {
           });
           feedConfirmed = gate ? 1 : 0;
           if (gate) {
-            trendSignal = { bearish: true, reason: trend.reason };
+            trendSignal = {
+              bearish: true,
+              confirmations: trend.confirmations,
+              reason: trend.reason,
+            };
           }
         } else if (trend.confirmed) {
           // Gate disabled — trend flip alone is sufficient (operator override)
-          trendSignal = { bearish: true, reason: trend.reason };
+          trendSignal = {
+            bearish: true,
+            confirmations: trend.confirmations,
+            reason: trend.reason,
+          };
           feedConfirmed = 1;
         }
 
@@ -776,6 +855,16 @@ export async function runMonitor() {
           rugSignal,
           trendSignal,
           maxHoldMs: p.max_hold_ms ?? null,
+          // ── Phase 4.5 volatility facts (absent → engine = pre-4.5) ──────
+          // The engine's SPIKED gate re-checks the tracker's live
+          // `confirmations` counter against the raised threshold, so feeding
+          // trendSignal only after `confirmed` is correct — the extra-cost
+          // delay is applied at the engine, not the tracker.
+          volatility: volatilityCtx,
+          structureStop: structureStopCtx,
+          stopConfirmTicks: stopConfirmTicksCtx,
+          trendConfirmTicks: CONFIG.strategy.trendExitConfirmTicks,
+          trendExitSpikedExtraTicks: CONFIG.strategy.trendExitSpikedExtraTicks,
         };
         const decision = evaluateExitPolicy(
           {
@@ -799,6 +888,15 @@ export async function runMonitor() {
           trend_bearish: trend.bearish,
           trend_confirmations: trend.confirmations,
           effective_stop_pct: effCfg.stopLossPct,
+          // Phase 4.5: volatility/regime facts + structure-stop level
+          atr_close_ton: volatilityCtx?.atrCloseTon ?? null,
+          volatility_regime: volatilityCtx?.regime ?? null,
+          realized_vol: volatilityCtx?.realizedVol ?? null,
+          structure_stop_level_ton: structureStopCtx?.levelTon ?? null,
+          structure_break_ticks: structureStopCtx?.confirmedTicks ?? 0,
+          stop_confirm_ticks: stopConfirmTicksCtx ?? null,
+          trend_confirm_ticks: CONFIG.strategy.trendExitConfirmTicks,
+          spiked_extra_ticks: CONFIG.strategy.trendExitSpikedExtraTicks,
         });
 
         if (!decision) continue;
@@ -812,6 +910,46 @@ export async function runMonitor() {
         // 2026-08-09: every trigger is a FULL close — no TP1 partials remain.
         const sellTokens = p.amount_tokens;
         const costBasisPortion = costBasis;
+
+        // ── PHANTOM-BALANCE GUARD ─────────────────────────────────────────
+        // 2026-08-12: stale legacy rows can hold `amount_tokens` for jettons
+        // the wallet no longer owns (sold/rugged/reconciled on-chain, DB not
+        // updated). Selling requests a transfer of more than the real balance,
+        // the DeDust child swap bounces (exit 706) and the monitor retries the
+        // phantom sell every tick — a gas-burning retry storm. If the wallet
+        // truly holds zero of the master, there is nothing to recover: close
+        // the row STOPPED and stop retrying. A null read (RPC failure) is
+        // treated as "keep trying" (fail closed — do not book a false close).
+        const tierHandle = isCoordinatorStarted()
+          ? getCoordinator().getTierHandle(tier)?.address
+          : undefined;
+        if (tierHandle) {
+          let walletBalance: bigint | null = null;
+          try {
+            walletBalance = await readUserJettonBalance(
+              client,
+              Address.parse(p.jetton_master),
+              Address.parse(tierHandle),
+            );
+          } catch (e: any) {
+            log.warn("MGR", `[${tier.toUpperCase()}] balance read failed for ${p.id}: ${e.message}`);
+          }
+          if (walletBalance !== null && walletBalance <= 0n) {
+            log.warn(
+              "MGR",
+              `[${tier.toUpperCase()}] ${decision.trigger} for ${p.symbol || p.jetton_master.slice(0, 8)}: wallet holds 0 ${p.symbol || "jettons"} on-chain — phantom position, closing STOPPED without sell`,
+            );
+            positionsStore.upsert({
+              ...p,
+              status: "STOPPED",
+              close_at: Date.now(),
+              close_tx: "reconcile_phantom_20260812",
+              current_price_ton: curTon,
+            });
+            forgetPosition(p.id, p.jetton_master);
+            continue;
+          }
+        }
 
         // ── ACCOUNTING quote: real full-size output for the sold portion ──
         // The mark is deliberately impact-free for DECIDING; realized PnL must

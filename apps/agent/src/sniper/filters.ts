@@ -208,12 +208,42 @@ export interface ExitState {
   positionTon?: number;
   /** Flat round-trip router gas in TON (defaults to 0.2). */
   roundTripGasTon?: number;
+  /**
+   * Hard time-stop inputs (Phase 5.1). When `maxHoldMs` > 0 and the
+   * position has been open at least that long, `time_exit` fires BEFORE the
+   * static stop — a benign-pnl thesis that hasn't played out closes on time.
+   */
+  entryTimeMs?: number;
+  now?: number;
+  maxHoldMs?: number;
+  /**
+   * Vol-widened SL inputs (Phase 5.1). `realizedVol` elevated vs
+   * `baseRealizedVol` widens the effective stop loss-side only (the
+   * conversation chain's pre-hunt low-vol 3×ATR was too narrow for an
+   * 18–20% flash drop). Absent either value → plain static stop.
+   */
+  realizedVol?: number;
+  baseRealizedVol?: number;
+  /** Absolute cap (%) for the vol-widened stop. Absent → plain static stop. */
+  slVolWidenMaxPct?: number;
+  // ── Peak-giveback trail (§2.2, 2026-08-11) ─────────────────────────────
+  // Profit-armed, full-exit trail: a realized winner may give back a
+  // configured % of its peak before closing. NOT a trailing ratchet — it
+  // never tightens below the static floor and can only exit in profit.
+  // Every field optional: when the engine passes none (ships OFF per §2.5)
+  // the trail is silent and behaviour is unchanged.
+  peakPriceTon?: number; // monotonic peak (engine ratchets upward only)
+  givebackEnabled?: boolean; // SNIPER_GIVEBACK_ENABLED
+  givebackArmPct?: number; // trail arms once peak >= entry×(1+arm/100)
+  givebackDropPct?: number; // exit when price gives back drop% from peak
 }
 
 export type ExitAction =
   | { action: "hold"; reason?: string }
   | { action: "stop_loss"; reason: string }
-  | { action: "trend_exit"; reason: string };
+  | { action: "trend_exit"; reason: string }
+  | { action: "time_exit"; reason: string }
+  | { action: "giveback_exit"; reason: string };
 
 /**
  * Net proceed from closing at `pnlPct` on a position of `positionTon`, after
@@ -246,6 +276,100 @@ export function netProceedsTon(pnlPct: number, positionTon: number, gasTon: numb
  * to save money, and firing would lock a net loss that the flat gas makes
  * permanent. Those hold, with the gas math journaled for the operator.
  */
+// ── Peak-giveback trail (§2.2, 2026-08-11) ──────────────────────────
+//
+// Profit-armed, full-exit trail for winners. NOT a trailing stop in the sense
+// the 2026-08-09 directive forbids: a trailing ratchet is loss-side; the
+// giveback arms only in profit and its level is clamped to NET breakeven, so
+// it can never fire at a loss and never tightens below the static floor.
+// Ships OFF (SNIPER_GIVEBACK_ENABLED=false) — behaviour-neutral until the
+// workstream-C sweep picks values.
+
+export interface GivebackInput {
+  entryPriceTon: number;
+  /** Monotonic peak — engine ratchets upward only (invariant 4). */
+  peakPriceTon: number;
+  currentPriceTon: number;
+  enabled?: boolean;
+  /** Arm once peak >= entry × (1 + armPct/100) (invariant 1: profit-armed). */
+  armPct?: number;
+  /** Exit when price gives back dropPct% from the peak. */
+  dropPct?: number;
+  positionTon?: number;
+  roundTripGasTon?: number;
+}
+
+/**
+ * Pure giveback decision. Returns the exit reason when the trail fires, else
+ * null (trail silent / not armed / disabled).
+ *
+ * The clamp (§2.4): a naive `peak × (1 − drop/100)` with a low arm and a
+ * large drop crosses below entry (arm +10%, drop 30% → level 0.77 × entry =
+ * a 23% loss). The level is therefore floored at the price that nets the
+ * flat round-trip gas back — the same gas math netProceedsTon encodes
+ * (a close at raw entry still loses the router gas). The floor guarantees
+ * invariant 2 (never loss-side) mechanically, without trusting config.
+ */
+export function givebackExit(g: GivebackInput): string | null {
+  if (!g.enabled) return null;
+  if (!(g.peakPriceTon > 0) || !(g.entryPriceTon > 0) || !(g.currentPriceTon > 0)) return null;
+
+  // Invariant 1: profit-armed — the trail does not exist below the arm level.
+  const armLevel = g.entryPriceTon * (1 + (g.armPct ?? 0) / 100);
+  if (g.peakPriceTon < armLevel) return null;
+
+  // The clamp: never below net breakeven. `positionTon × (1 + gas/position)`
+  // is the price at which netProceedsTon = cost basis, i.e. gas is recovered.
+  const positionTon = g.positionTon ?? 0;
+  const gasTon = g.roundTripGasTon ?? 0.2;
+  const netBreakevenPrice =
+    positionTon > 0 ? g.entryPriceTon * (1 + gasTon / positionTon) : g.entryPriceTon;
+  const level = Math.max(g.peakPriceTon * (1 - (g.dropPct ?? 0) / 100), netBreakevenPrice);
+
+  // Invariant 3: full exit only — fire once the price gives back drop% (or
+  // hits the clamp first). Invariant 2: level >= netBreakevenPrice > entry,
+  // so this can only ever exit in net profit.
+  if (g.currentPriceTon <= level) {
+    const pnlPct = (g.currentPriceTon / g.entryPriceTon - 1) * 100;
+    return (
+      `giveback: peak ${g.peakPriceTon.toFixed(8)} → ${g.currentPriceTon.toFixed(8)} ` +
+      `(level ${level.toFixed(8)}, clamp ${netBreakevenPrice.toFixed(8)}), pnl ${pnlPct.toFixed(1)}%`
+    );
+  }
+  return null;
+}
+
+/**
+ * Effective stop width for the static-stop branch (Phase 5.1 vol-widened SL).
+ * When `realizedVol` is finite and meaningfully elevated vs the entry
+ * baseline, the floor WIDENS loss-side only — re-anchored off post-entry vol
+ * per the conversation chain's backtest conclusion (a pre-hunt low-vol 3×ATR
+ * was too narrow for an 18–20% flash drop). Clamped to `slVolWidenMaxPct`.
+ * Never trails a winner: the widened stop only lowers the loss threshold.
+ */
+export function effectiveStopPct(
+  stopLossPct: number,
+  realizedVol?: number,
+  baseRealizedVol?: number,
+  slVolWidenMaxPct?: number,
+): number {
+  const base = Math.abs(stopLossPct);
+  if (
+    !Number.isFinite(realizedVol) ||
+    !Number.isFinite(baseRealizedVol) ||
+    baseRealizedVol <= 0 ||
+    realizedVol <= baseRealizedVol
+  ) {
+    return base;
+  }
+  // Linear interpolation of the excess vol onto the stop width, so the stop
+  // grows with how much hotter realized vol is than the entry baseline.
+  const excess = realizedVol / baseRealizedVol; // e.g. 2.0 = 2x baseline
+  const widened = base * excess;
+  const cap = slVolWidenMaxPct != null && slVolWidenMaxPct > base ? slVolWidenMaxPct : base;
+  return Math.min(widened, cap);
+}
+
 export function decideExit(s: ExitState): ExitAction {
   const pnlPct = s.entryPriceTon > 0 ? (s.currentPriceTon / s.entryPriceTon - 1) * 100 : -100;
   const positionTon = s.positionTon ?? 1; // conservative default: assume viable size
@@ -272,8 +396,43 @@ export function decideExit(s: ExitState): ExitAction {
     };
   }
 
-  if (pnlPct <= -Math.abs(s.stopLossPct)) {
-    return { action: "stop_loss", reason: `pnl ${pnlPct.toFixed(1)}% <= -${Math.abs(s.stopLossPct)}%` };
+  // §2.2 peak-giveback trail — precedence: trend → giveback → time → stop.
+  // The trail slots AFTER trend (a confirmed flip is stronger evidence and
+  // must outrank a giveback that may be triggered by the same dip) and BEFORE
+  // time (a giveback exit carries a real reason — peak giveback — that a
+  // time_exit would otherwise mask in the journal).
+  if (s.peakPriceTon != null && (s.givebackEnabled || s.givebackArmPct != null || s.givebackDropPct != null)) {
+    const giveback = givebackExit({
+      entryPriceTon: s.entryPriceTon,
+      peakPriceTon: s.peakPriceTon,
+      currentPriceTon: s.currentPriceTon,
+      enabled: s.givebackEnabled,
+      armPct: s.givebackArmPct,
+      dropPct: s.givebackDropPct,
+      positionTon: s.positionTon,
+      roundTripGasTon: s.roundTripGasTon,
+    });
+    if (giveback) return { action: "giveback_exit", reason: giveback };
+  }
+
+  // Hard time-stop (Phase 5.1): thesis didn't play out within maxHoldMs.
+  // Runs AFTER the trend block (engine priority: trend → time → stop) so a
+  // confirmed flip on a shallow loser keeps the gas-noise-floor HOLD even at
+  // the deadline — closing there would lock the net loss the floor exists to
+  // avoid. Runs BEFORE the static stop: a benign-pnl position at the deadline
+  // closes on time, and a losing one closes regardless of stop width.
+  if (s.maxHoldMs && s.maxHoldMs > 0 && s.entryTimeMs != null && s.now != null) {
+    const heldMs = s.now - s.entryTimeMs;
+    if (heldMs >= s.maxHoldMs) {
+      const mins = (s.maxHoldMs / 60_000).toFixed(1);
+      return { action: "time_exit", reason: `max hold ${mins}m exceeded (held ${(heldMs / 60_000).toFixed(1)}m)` };
+    }
+  }
+
+  const effStop = effectiveStopPct(s.stopLossPct, s.realizedVol, s.baseRealizedVol, s.slVolWidenMaxPct);
+  if (pnlPct <= -effStop) {
+    const widenNote = effStop > Math.abs(s.stopLossPct) ? ` (vol-widened to ${effStop}%)` : "";
+    return { action: "stop_loss", reason: `pnl ${pnlPct.toFixed(1)}% <= -${effStop}%${widenNote}` };
   }
 
   return { action: "hold" };

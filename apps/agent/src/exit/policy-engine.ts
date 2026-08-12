@@ -32,10 +32,23 @@
  * gate must never be stricter than the entry gate that admitted the position.
  * Emergencies now require a measured DELTA (`rugSignal`, see exit/rug-detector.ts):
  * liquidity drain, or a safety dimension that went good → bad.
+ *
+ * ── Phase 4.5: volatility- & structure-adaptive exits ─────────────────────
+ * The trend and stop paths consume optional `volatility`/`structureStop` facts
+ * computed in the hot path from SMOOTHED closes (EMA/ATR window in
+ * exit/volatility-regime.ts). Absent facts = exactly the pre-4.5 behavior, so
+ * callers that do not inject them (e.g. the sniper engine) are untouched.
+ *
+ * FLASH-CRASH SEPARATION: the smoothing layer deliberately sits ONLY on the
+ * trend/stop path. The flash-crash circuit breaker (`rugSignal` → emergency_exit,
+ * exit/rug-detector.ts) measures liquidity drain / safety deltas on RAW ticks
+ * and is NOT routed through these smoothed facts — a genuine liquidity drain
+ * must trip instantly, not after N smoothed closes.
  */
 
 import type { TierRiskConfig } from "../risk/guardrails";
 import type { RugSignal } from "./rug-detector";
+import type { VolatilityRegime } from "./volatility-regime";
 
 /** The exit triggers of the §8.5 state machine (as of 2026-08-09). */
 export type ExitTrigger =
@@ -97,8 +110,59 @@ export interface ExitPolicyContext {
    * operator's 2026-08-09 close rule. `bearish: true` fires a full `trend_exit`.
    * The confirmation filter (consecutive ticks) lives in the tracker, so a
    * signal present here has already survived the whipsaw check.
+   *
+   * `confirmations` (consecutive bearish ticks so far) is carried so the
+   * engine can apply regime-adaptive confirmation cost in a SPIKED market
+   * without coupling to TrendConfig.
    */
-  trendSignal?: { bearish: boolean; reason?: string } | null;
+  trendSignal?: {
+    bearish: boolean;
+    confirmations?: number;
+    reason?: string;
+  } | null;
+  /**
+   * Volatility- & structure-adaptive exit facts (Phase 4.5). Absent → the
+   * engine behaves exactly as before: fixed-distance stop + plain trend exit.
+   */
+  volatility?: {
+    /** Close-only ATR proxy, in price units (per-position window). */
+    atrCloseTon: number | null;
+    /** CALM/NORMAL/SPIKED classification ("unknown" before the lookback fills). */
+    regime: VolatilityRegime;
+    /** Rolling realized vol (per-tick σ of log returns), or null pre-warm-up. */
+    realizedVol: number | null;
+  } | null;
+  /**
+   * Structure stop: high-water close − mult×ATR, clamped to never sit below
+   * the static % floor. `confirmedTicks` counts consecutive closes beyond the
+   * level — the stop fires only when the mark has been UNDER the level for
+   * `stopConfirmTicks` closes, never on a single wick/intrabar excursion.
+   */
+  structureStop?: {
+    levelTon: number | null;
+    confirmedTicks: number;
+  } | null;
+  /**
+   * Consecutive closes beyond the structure level required before the
+   * structure stop fires (close-confirmation SL). Absent/0 → the structure
+   * stop is inert and the static % floor is the only loss stop (backward
+   * compatible with pre-Phase-4.5 callers).
+   */
+  stopConfirmTicks?: number;
+  /**
+   * Base consecutive bearish ticks that count as a confirmed flip in NORMAL
+   * markets (the tracker's `confirmTicks`). Combined with
+   * `trendExitSpikedExtraTicks`, the engine re-gates `trend_exit` in a SPIKED
+   * regime: `confirmations >= trendConfirmTicks + trendExitSpikedExtraTicks`.
+   * Absent → the SPIKED extra-cost gate is skipped (plain `bearish` fires).
+   */
+  trendConfirmTicks?: number;
+  /**
+   * Extra consecutive bearish ticks required before `trend_exit` fires while
+   * `volatility.regime === "spiked"`. Absent/0 → SPIKED adds nothing to the
+   * configured confirmation cost.
+   */
+  trendExitSpikedExtraTicks?: number;
   /**
    * Per-position time limit in ms (the `max_hold_ms` column).
    * `0`/`null`/`undefined` → TimeExit disabled.
@@ -173,13 +237,32 @@ export function evaluateExitPolicy(
   // Operator directive 2026-08-09: no TP/trailing targets. Winners ride the
   // trend; a CONFIRMED downtrend flip is the close signal (the consecutive-tick
   // whipsaw filter ran in exit/trend-monitor.ts before this was set).
-  if (ctx.trendSignal?.bearish) {
+  //
+  // Phase 4.5 regime filter: in a SPIKED market single-tick noise passes a
+  // fixed confirmation counter faster — a raw bearish flag that already cleared
+  // `confirmTicks` on a normal day can be < 1s of noise on a volatile one. When
+  // the regime is SPIKED and the engine knows both the base tick count and the
+  // extra cost, it requires `confirmations >= trendConfirmTicks +
+  // trendExitSpikedExtraTicks` before letting the flip through. CALM/NORMAL
+  // keeps the configured cost exactly. Absent facts → plain `bearish` fires.
+  const spiked =
+    ctx.volatility?.regime === "spiked" &&
+    ctx.trendConfirmTicks != null &&
+    ctx.trendExitSpikedExtraTicks != null &&
+    ctx.trendExitSpikedExtraTicks > 0;
+  const confirmations = ctx.trendSignal?.confirmations ?? 0;
+  const spikedGatePassed =
+    !spiked || confirmations >= ctx.trendConfirmTicks! + ctx.trendExitSpikedExtraTicks!;
+  if (ctx.trendSignal?.bearish && spikedGatePassed) {
     return {
       trigger: "trend_exit",
       sellFraction: 1.0,
       nextStatus: "CLOSED",
       costBasisScale: 1.0,
-      reason: `trend exit: ${ctx.trendSignal.reason ?? "significant downtrend flip"}`,
+      reason: spiked
+        ? `trend exit: ${ctx.trendSignal.reason ?? "significant downtrend flip"} ` +
+          `(SPIKED vol, ${confirmations} >= ${ctx.trendConfirmTicks! + ctx.trendExitSpikedExtraTicks!} confirms)`
+        : `trend exit: ${ctx.trendSignal.reason ?? "significant downtrend flip"}`,
     };
   }
 
@@ -207,6 +290,35 @@ export function evaluateExitPolicy(
       nextStatus: "STOPPED",
       costBasisScale: 1.0,
       reason: `stop loss: pnl=${pnl.toFixed(2)}% <= -${tierCfg.stopLossPct}%`,
+    };
+  }
+
+  // ── 5. Structure stop — close-confirmed break of the ATR band ──────────
+  // Phase 4.5: level = high-water close − mult×ATR, clamped to never sit below
+  // the static % floor (which fired above, so anything reaching here is a
+  // structure level ABOVE the hard line — a shallower, earlier stop). Fires
+  // only after `stopConfirmTicks` CONSECUTIVE closes under the level — a single
+  // wick or intrabar excursion past the level does NOT stop the position out.
+  // Absent `structureStop`/`levelTon` → behavior unchanged (static line only).
+  const structLevel = ctx.structureStop?.levelTon;
+  const structTicks = ctx.structureStop?.confirmedTicks ?? 0;
+  const stopConfirmTicks = ctx.stopConfirmTicks ?? 0;
+  if (
+    structLevel != null &&
+    Number.isFinite(structLevel) &&
+    structLevel > 0 &&
+    currentPriceUsd <= structLevel &&
+    stopConfirmTicks > 0 &&
+    structTicks >= stopConfirmTicks
+  ) {
+    return {
+      trigger: "stop_loss",
+      sellFraction: 1.0,
+      nextStatus: "STOPPED",
+      costBasisScale: 1.0,
+      reason: `stop loss: structure break price=${currentPriceUsd.toFixed(6)} <= ` +
+        `level=${structLevel.toFixed(6)} for ${structTicks} consecutive closes ` +
+        `(>= ${stopConfirmTicks})`,
     };
   }
 

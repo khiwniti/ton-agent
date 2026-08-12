@@ -144,6 +144,32 @@ export const CONFIG = {
         trendExitHistory: num("TREND_EXIT_HISTORY", 60),
         trendExitMinObservations: num("TREND_EXIT_MIN_OBSERVATIONS", 6),
         trendExitConfirmEnabled: bool("TREND_EXIT_CONFIRM_ENABLED", true),
+        // ── Volatility- & structure-adaptive exits (2026-08-11) ──────────
+        // Pure facts computed per tick in hotpath/position-monitor.ts via
+        // exit/volatility-regime.ts and injected into ExitPolicyContext.
+        // Master kill switch: VOLATILITY_REGIME_ENABLED=false restores the
+        // fixed-distance stop + fixed-confirmation trend exit exactly.
+        volatilityRegimeEnabled: bool("VOLATILITY_REGIME_ENABLED", true),
+        // Wilder period + realized-vol window (close-only ATR proxy).
+        volatilityLookback: num("VOLATILITY_LOOKBACK", 14),
+        // realizedVol/baseline above this → SPIKED (extra trend-exit cost).
+        volatilitySpikeThreshold: num("VOLATILITY_SPIKE_THRESHOLD", 2.5),
+        // realizedVol/baseline below this → CALM (no extra cost).
+        volatilityCalmRatio: num("VOLATILITY_CALM_RATIO", 0.5),
+        // Consecutive ticks required in a new regime before switching
+        // (hysteresis — mirrors the trend tracker's confirmation pattern).
+        volatilityConfirmTicks: num("VOLATILITY_CONFIRM_TICKS", 2),
+        // Structure stop = highWaterClose − stopAtrMult × ATR, clamped into
+        // [0.5, 2]× ATR and never below the static % floor.
+        stopAtrMult: num("STOP_ATR_MULT", 1.0),
+        // Close-confirmation SL: consecutive closes beyond the structure level
+        // before stop_loss fires (no wick/intrabar stop).
+        stopConfirmTicks: num("STOP_CONFIRM_TICKS", 2),
+        // Chandelier band (highWater − trendExitAtrMult × ATR). Corroboration
+        // ONLY — journaled, never a sell trigger (2026-08-09 directive).
+        trendExitAtrMult: num("TREND_EXIT_ATR_MULT", 3.0),
+        // Extra trend-exit confirm ticks required while the regime is SPIKED.
+        trendExitSpikedExtraTicks: num("TREND_EXIT_SPIKED_EXTRA_TICKS", 2),
     },
     watchlist: opt("WATCHLIST", "")
         .split(",")
@@ -230,6 +256,28 @@ export const CONFIG = {
         trendExitHistory: num("TREND_EXIT_HISTORY", 60),
         trendExitMinObservations: num("TREND_EXIT_MIN_OBSERVATIONS", 6),
         trendExitConfirmEnabled: bool("TREND_EXIT_CONFIRM_ENABLED", true),
+        // Phase 5.1: hard time-stop + vol-widened SL (research:
+        // 05-technique-exit-matrix.md). Both are loss-side/time-side rules —
+        // the 2026-08-09 directive keeps winners riding to trend_exit.
+        // 0 = disabled. Sniper positions carry no tier — global key only,
+        // recomputed live at monitor time (config changes take effect on the
+        // next tick).
+        maxHoldMs: num("SNIPER_MAX_HOLD_MS", 0),
+        slVolWidenEnabled: bool("SNIPER_SL_VOL_WIDEN", false),
+        // Absolute widened-stop floor cap (%). Widening is loss-side only —
+        // the effective stop grows when realized vol is elevated vs the
+        // entry baseline, but never trails a winner.
+        slVolWidenMaxPct: num("SNIPER_SL_VOL_WIDEN_MAX_PCT", 50),
+        // ── Peak-giveback trail (§2.2, spec 2026-08-11) ─────────────────────
+        // Profit-armed, full-exit trail for winners. NOT the trailing ratchet
+        // the 2026-08-09 directive forbids: arms only in profit and clamps to
+        // NET breakeven, so it can never fire at a loss. Ships OFF (behaviour-
+        // neutral) per §2.5; the workstream-C sweep picks values later.
+        givebackEnabled: bool("SNIPER_GIVEBACK_ENABLED", false),
+        // Arm once peak >= entry × (1 + armPct/100).
+        givebackArmPct: num("SNIPER_GIVEBACK_ARM_PCT", 10),
+        // Exit when price gives back dropPct% from the peak.
+        givebackDropPct: num("SNIPER_GIVEBACK_DROP_PCT", 15),
         // Use the agentic budgeting wallet for sends (production-test mode
         // per the user). False = direct master-wallet send.
         useBudgetingWallet: bool("SNIPER_USE_BUDGETING_WALLET", false),

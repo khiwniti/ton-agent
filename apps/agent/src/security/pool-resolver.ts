@@ -196,3 +196,80 @@ export async function resolvePool(
   // the rest of the day. Re-resolving costs two RPC calls on the next tick.
   return noPoolResult("no pool found on Ston.fi or DeDust");
 }
+
+/**
+ * Derive a jetton's TON price from its resolved DEX pool's live reserves.
+ *
+ * Both STON.fi (pTON-first query) and DeDust (`Asset.native()` first) reserve
+ * ordering place the TON side at index 0, so one formula serves both:
+ *   priceNano = reserve0(raw TON) × 10^decimals / reserve1(raw jetton)
+ * i.e. nanoTON per one whole jetton. BigInt throughout so trillion-supply
+ * reserves don't lose precision at Number range. Returns null when the pool
+ * is unreadable, the DeDust readiness gate fails, or the derived price is out
+ * of a sane bound — callers fall back to TONAPI market_data.
+ */
+export async function poolPrice(
+  client: TonClient,
+  jettonMaster: Address,
+  pool: PoolResolutionResult,
+  jettonDecimals: number,
+): Promise<{ priceTon: number; priceNano: bigint } | null> {
+  if (!pool.poolAddress || pool.source === "none") return null;
+  const dec =
+    Number.isFinite(jettonDecimals) && jettonDecimals > 0 ? Math.floor(jettonDecimals) : 9;
+  try {
+    let tonNano: bigint;
+    let jettonRaw: bigint;
+    if (pool.source === "stonfi") {
+      const poolObj = client.open(DEX.v1.Pool.create(Address.parse(pool.poolAddress)));
+      const data = await poolObj.getPoolData();
+      tonNano = data.reserve0;
+      jettonRaw = data.reserve1;
+    } else if (pool.source === "dedust") {
+      const factory = client.open(Factory.createFromAddress(MAINNET_FACTORY_ADDR));
+      const p = await factory.getPool(PoolType.VOLATILE, [
+        Asset.native(),
+        Asset.jetton(jettonMaster),
+      ]);
+      const opened = client.open(p);
+      const readiness = await opened.getReadinessStatus();
+      if (readiness !== ReadinessStatus.READY) return null;
+      const reserves = await opened.getReserves();
+      if (!reserves || reserves.length < 2) return null;
+      tonNano = BigInt(reserves[0]);
+      jettonRaw = BigInt(reserves[1]);
+    } else {
+      return null;
+    }
+    if (tonNano <= 0n || jettonRaw <= 0n) return null;
+    const scale = BigInt(10 ** dec);
+    const priceNano = (tonNano * scale) / jettonRaw; // nanoTON per 1 whole jetton
+    if (priceNano <= 0n || priceNano > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    const priceTon = Number(priceNano) / 1e9;
+    if (!Number.isFinite(priceTon) || priceTon <= 0) return null;
+    return { priceTon, priceNano };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * USD market cap from a pool-derived price + the master's raw total supply.
+ * BigInt math; returns null when the result overflows safe Number range.
+ */
+export function marketCapUsdFromPool(
+  priceNano: bigint,
+  totalSupplyRaw: bigint,
+  jettonDecimals: number,
+  tonUsd: number,
+): number | null {
+  if (priceNano <= 0n || totalSupplyRaw <= 0n) return null;
+  if (!Number.isFinite(tonUsd) || tonUsd <= 0) return null;
+  const dec =
+    Number.isFinite(jettonDecimals) && jettonDecimals > 0 ? Math.floor(jettonDecimals) : 9;
+  const scale = BigInt(10 ** dec);
+  // Cap in nanoTON = (whole supply) × (nanoTON per whole jetton).
+  const capNano = (totalSupplyRaw * priceNano) / scale;
+  if (capNano > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return (Number(capNano) / 1e9) * tonUsd;
+}

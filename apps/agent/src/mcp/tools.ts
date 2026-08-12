@@ -11,12 +11,15 @@
  */
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
+import { Address, Dictionary } from "@ton/ton";
 import { CONFIG } from "../config";
 import { log } from "../logger";
 import { makeClient } from "../wallet/wallet";
 import { tonapiGet } from "../http/tonapi";
 import { postEnvelope } from "../webhook";
 import * as audit from "../security/audit";
+import { resolvePool, poolPrice, marketCapUsdFromPool } from "../security/pool-resolver";
+import { getTonUsd } from "../sniper/coingecko";
 import { getCoordinator, isCoordinatorStarted, ALL_TIERS, type Tier } from "../core/coordinator";
 import { positionsStore } from "../storage/store";
 import { newId } from "@ton-agent/shared";
@@ -164,35 +167,117 @@ export const executeSwapTool = tool(
     }
 );
 
-// ─────────────────────────────── 4. JETTON META ───────────────────────────────
+// ─────────────────────────────── 4. JETTON META / PRICE ───────────────────────────────
+// Price sourcing is ordered to cut TONAPI free-tier pressure: on-chain
+// `get_jetton_data` (decimals + total supply) first, then pool-derived price
+// from the resolved DEX pool (TON→USD via CoinGecko). TONAPI market_data is
+// used only as a fallback when no pool resolves.
+
+/** Decimals + total supply via on-chain `get_jetton_data`. */
+async function onChainJettonMeta(
+    client: ReturnType<typeof makeClient>,
+    master: string,
+): Promise<{ decimals: number; totalSupply: bigint } | null> {
+    try {
+        const { stack } = await client.runMethod(Address.parse(master), "get_jetton_data");
+        const totalSupply = stack.readBigNumber();
+        stack.readBoolean(); // mintable
+        stack.readAddressOpt(); // admin
+        const content = stack.readCellOpt();
+        let decimals = 9;
+        if (content) {
+            const s = content.beginParse();
+            // TEP-64 content type: 0x00 = on-chain dict, 0x01 = semi-chain
+            // (off-chain url + dict), 0x02 = off-chain url only. Only the
+            // on-chain dict carries the decimals key, so skip 0x01/0x02 and
+            // fail soft (default 9) rather than misparse a url as a dict.
+            if (s.loadUint(8) === 0x00) {
+                const dict = s.loadDict(Dictionary.Keys.BigUint(256), Dictionary.Values.Cell());
+                // TEP-64: decimals live at key 0x05 as a snake-encoded ASCII
+                // string (e.g. "9"), NOT a raw uint and NOT key 0x76.
+                const dcell = dict.get(0x05n)?.beginParse();
+                if (dcell) {
+                    const parsed = Number.parseInt(dcell.loadStringTail(), 10);
+                    if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 255) {
+                        decimals = parsed;
+                    }
+                }
+            }
+        }
+        return { decimals, totalSupply };
+    } catch {
+        return null;
+    }
+}
+
 export const getJettonMetaTool = tool(
     async ({ jettonMaster }: { jettonMaster: string }) => {
-        const data = await audit.getJetton(jettonMaster);
-        return data || { error: `no meta for ${jettonMaster}` };
+        const client = makeClient();
+        const onchain = await onChainJettonMeta(client, jettonMaster);
+        const [pool, data] = await Promise.all([
+            resolvePool(client, Address.parse(jettonMaster)),
+            audit.getJetton(jettonMaster),
+        ]);
+        const result: any = {
+            jettonMaster,
+            decimals: onchain?.decimals ?? null,
+            totalSupply: onchain ? onchain.totalSupply.toString() : null,
+            pool: pool && pool.poolAddress ? { address: pool.poolAddress, source: pool.source, liquidityTon: pool.liquidityTon } : null,
+        };
+        if (data) {
+            result.name = data?.metadata?.name ?? undefined;
+            result.symbol = data?.metadata?.symbol ?? undefined;
+            result.description = data?.metadata?.description ?? undefined;
+            result.image = data?.metadata?.image ?? undefined;
+            result.holders = data?.holders_count ?? undefined;
+            result.mintable = data?.mintable ?? undefined;
+            result.verification = data?.verification ?? undefined;
+        }
+        return Object.keys(result).length > 1 ? result : { error: `no meta for ${jettonMaster}` };
     },
     {
         name: "get_jetton_meta",
-        description: "Fetch TONAPI metadata for a jetton (name, symbol, holders, supply, market stats). Use this to confirm a token identity and spot scam duplicates.",
+        description: "Fetch metadata for a jetton: on-chain decimals/supply + DEX pool presence, enriched with TONAPI meta (name, symbol, holders, verification) when TONAPI is configured. Use this to confirm a token identity and spot scam duplicates.",
         schema: z.object({ jettonMaster: z.string() }),
     }
 );
 
-// ─────────────────────────────── 5. JETTON PRICE (TONAPI retry-aware) ───────────────────────────────
+// ─────────────────────────────── 5. JETTON PRICE (pool-first, TONAPI fallback) ───────────────────────────────
 export const getJettonPriceTool = tool(
     async ({ jettonMaster }: { jettonMaster: string }) => {
         try {
-            const r = await tonapiGet(`/jettons/${jettonMaster}`, { timeoutMs: 8000 });
-            const priceUsd = r.data?.market_data?.price;
-            const priceBtc = r.data?.market_data?.price_btc;
-            const capUsd = r.data?.market_data?.market_cap;
-            return { priceUsd, priceBtc, marketCapUsd: capUsd, source: "tonapi" };
+            const client = makeClient();
+            const onchain = await onChainJettonMeta(client, jettonMaster);
+            const pool = await resolvePool(client, Address.parse(jettonMaster));
+            if (pool && pool.poolAddress && pool.source !== "none") {
+                const p = await poolPrice(client, Address.parse(jettonMaster), pool, onchain?.decimals ?? 9);
+                if (p) {
+                    const tonUsd = await getTonUsd();
+                    const cap = onchain && tonUsd
+                        ? marketCapUsdFromPool(p.priceNano, onchain.totalSupply, onchain.decimals, tonUsd)
+                        : null;
+                    return { priceUsd: p.priceTon * (tonUsd ?? 0), priceTon: p.priceTon, marketCapUsd: cap, source: "pool" };
+                }
+            }
+            if (CONFIG.tonapiKey) {
+                const r = await tonapiGet(`/jettons/${jettonMaster}`, { timeoutMs: 8000 });
+                const priceUsd = r.data?.market_data?.price ?? null;
+                return {
+                    priceUsd,
+                    priceTon: null,
+                    priceBtc: r.data?.market_data?.price_btc ?? null,
+                    marketCapUsd: r.data?.market_data?.market_cap ?? null,
+                    source: "tonapi",
+                };
+            }
+            return { error: `no pool resolved and TONAPI key not configured for ${jettonMaster}` };
         } catch (e: any) {
             return { error: e.message };
         }
     },
     {
         name: "get_jetton_price",
-        description: "Get the current USD price and market cap of a TON jetton via TONAPI. Call this before sizing positions, computing targets, or comparing token candidates.",
+        description: "Get the current USD price and market cap of a TON jetton. Derives price from the live DEX pool reserves (STON.fi/DeDust) when a pool exists, falling back to TONAPI market data when TONAPI is configured. Call this before sizing positions or comparing token candidates.",
         schema: z.object({ jettonMaster: z.string() }),
     }
 );
@@ -200,14 +285,37 @@ export const getJettonPriceTool = tool(
 // ─────────────────────────────── 6. WATCH JETTON (for monitoring) ───────────────────────────────
 export const watchPositionTool = tool(
     async ({ jettonMaster }: { jettonMaster: string }) => {
-        const data = await audit.getJetton(jettonMaster);
-        const priceUsd = data?.market_data?.price ?? null;
-        const holders = data?.holders_count ?? 0;
-        return { jettonMaster, priceUsd, holders };
+        const client = makeClient();
+        const onchain = await onChainJettonMeta(client, jettonMaster);
+        const pool = await resolvePool(client, Address.parse(jettonMaster));
+        let priceUsd: number | null = null;
+        let source: "pool" | "tonapi" | "none" = "none";
+        if (pool && pool.poolAddress && pool.source !== "none") {
+            const p = await poolPrice(client, Address.parse(jettonMaster), pool, onchain?.decimals ?? 9);
+            if (p) {
+                const tonUsd = await getTonUsd();
+                priceUsd = p.priceTon * (tonUsd ?? 0);
+                source = "pool";
+            }
+        }
+        let holders: number | null = null;
+        if (source !== "pool" && CONFIG.tonapiKey) {
+            try {
+                const r = await tonapiGet(`/jettons/${jettonMaster}`, { timeoutMs: 8000 });
+                if (priceUsd === null && r.data?.market_data?.price) {
+                    priceUsd = r.data.market_data.price;
+                    source = "tonapi";
+                }
+                holders = r.data?.holders_count ?? null;
+            } catch {
+                // fail soft — price stays null, holders stays null
+            }
+        }
+        return { jettonMaster, priceUsd, holders, source };
     },
     {
         name: "watch_position",
-        description: "Spot-check a jetton you currently hold; returns its latest price and holder count. Call periodically after a buy to drive exit decisions.",
+        description: "Spot-check a jetton you currently hold; returns its latest price (pool-derived, TONAPI fallback) and holder count (TONAPI, when configured). Call periodically after a buy to drive exit decisions.",
         schema: z.object({ jettonMaster: z.string() }),
     }
 );
@@ -347,6 +455,10 @@ export const recordPositionTool = tool(
             cost_basis_ton: costBasisTon,
             confidence_score: confidenceScore ?? 0,
             status: "OPEN",
+            // Technique discriminator (research/05-technique-exit-matrix.md):
+            // "swing" for the hotpath/monitor path, "sniper" for the x1000
+            // memepad engine. Records provenance; nothing gates on it yet.
+            technique: "swing",
             // Phase 4 hot-path exit state — populate at entry so TimeExit can fire.
             // max_hold_ms comes from a per-tier env default (0/unset = disabled),
             // keeping TimeExit opt-in and behaviour-neutral for existing positions.
