@@ -18,3 +18,7 @@ test("aligned TP/SL: volatility-widened SL ships enabled by default", () => {
 test("aligned TP/SL: widened-stop cap default is 50%", () => {
   assert.equal(CONFIG.sniper.slVolWidenMaxPct, 50);
 });
+
+test("aligned TP/SL: SNIPER time-stop ships at 1h", () => {
+  assert.equal(CONFIG.sniper.maxHoldMs, 3_600_000);
+});

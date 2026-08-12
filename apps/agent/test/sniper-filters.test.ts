@@ -226,6 +226,20 @@ test("decideExit: trend flip outranks giveback on the same tick (precedence)", (
   assert.match(d.reason, /trend flipped to downtrend/);
 });
 
+test("decideExit: time_exit fires once maxHoldMs elapsed (2026-08-12 alignment)", () => {
+  const s = state({
+    entryPriceTon: 0.001,
+    currentPriceTon: 0.0012, // +20% — above stop, no trend flip
+    entryTimeMs: 1_700_000_000_000,
+    now: 1_700_003_600_000, // +1h
+    maxHoldMs: 3_600_000,
+  });
+  const d = decideExit(s);
+  assert.equal(d.action, "time_exit");
+  // Shipped reason (filters.ts): `max hold ${mins}m exceeded (held ...m)`.
+  assert.match(d.reason, /max hold/i);
+});
+
 test("givebackExit: peak below entry with enabled trail → silent (never arms on a loss)", () => {
   const s = state({
     entryPriceTon: 0.001,

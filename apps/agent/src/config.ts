@@ -262,7 +262,7 @@ export const CONFIG = {
         // 0 = disabled. Sniper positions carry no tier — global key only,
         // recomputed live at monitor time (config changes take effect on the
         // next tick).
-        maxHoldMs: num("SNIPER_MAX_HOLD_MS", 0),
+        maxHoldMs: num("SNIPER_MAX_HOLD_MS", 3600000),
         slVolWidenEnabled: bool("SNIPER_SL_VOL_WIDEN", true),
         // Absolute widened-stop floor cap (%). Widening is loss-side only —
         // the effective stop grows when realized vol is elevated vs the
