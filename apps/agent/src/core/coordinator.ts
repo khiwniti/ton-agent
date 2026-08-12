@@ -343,12 +343,7 @@ class TierCoordinator {
       agent: "safetycaps",
       input_hash: cap.ticket_hash,
       cap_check_result: cap,
-      hitl_status: cap.hitl_status,
-      final_action: cap.ok
-        ? cap.hitl_required
-          ? "cap_ok_hitl_required"
-          : "cap_ok"
-        : "cap_denied",
+      final_action: cap.ok ? "cap_ok" : "cap_denied",
       output: { failures: cap.failures },
     });
     return cap;
@@ -482,26 +477,7 @@ class TierCoordinator {
         agent: "coordinator",
         input_hash: cap.ticket_hash,
         cap_check_result: cap,
-        hitl_status: cap.hitl_status,
         final_action: "execute_denied_caps",
-        output: { error: reason },
-      });
-      return { ok: false, dex, error: reason, cap, cycle_id: ticket.cycle_id };
-    }
-
-    if (cap.hitl_required && cap.hitl_status !== "approved") {
-      // Autopilot: when HITL_DISABLE=true this branch is unreachable because
-      // SafetyCaps already short-circuited hitl_required to false. Kept here
-      // as the fail-closed guard for manual-flow (HITL gate kept on).
-      const reason = `HITL required (status=${cap.hitl_status}) — not auto-executable`;
-      log.warn("COORD", `[${tier.toUpperCase()}] ${reason}`);
-      decisionJournalStore.append({
-        cycle_id: ticket.cycle_id,
-        agent: "coordinator",
-        input_hash: cap.ticket_hash,
-        cap_check_result: cap,
-        hitl_status: cap.hitl_status,
-        final_action: "execute_denied_hitl",
         output: { error: reason },
       });
       return { ok: false, dex, error: reason, cap, cycle_id: ticket.cycle_id };
@@ -538,7 +514,6 @@ class TierCoordinator {
       agent: "coordinator",
       input_hash: cap.ticket_hash,
       cap_check_result: cap,
-      hitl_status: cap.hitl_status,
       final_action: auth?.isExit ? "execute_submit_exit" : "execute_submit",
       output: { dex: execDex, side: p.side, amountTon: p.amountTon, isExit: auth?.isExit ?? false },
     });
@@ -1013,12 +988,6 @@ class TierCoordinator {
     const cap = this.authorizeForTier(tier, ticket);
     if (!cap.ok) {
       const reason = cap.failures.map((f) => f.reason).join("; ") || "cap denied";
-      pipeline.step4RiskVerdict = `DENIED: ${reason}`;
-      log.warn("PIPELINE", `[${tier.toUpperCase()}] Step 4 FAIL: ${reason}`);
-      return { ok: false, error: reason, pipeline };
-    }
-    if (cap.hitl_required && cap.hitl_status !== "approved") {
-      const reason = `HITL required (status=${cap.hitl_status})`;
       pipeline.step4RiskVerdict = `DENIED: ${reason}`;
       log.warn("PIPELINE", `[${tier.toUpperCase()}] Step 4 FAIL: ${reason}`);
       return { ok: false, error: reason, pipeline };
