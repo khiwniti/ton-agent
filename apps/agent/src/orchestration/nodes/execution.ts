@@ -4,7 +4,7 @@
  * Tools: @ton/mcp transact tools ONLY (swap, sign, submit).
  * NO text-ingestion tools — containment layer.
  * Model: cheap/fast (nemotron-3-ultra or local) — no reasoning needed, just mechanical execution.
- * Precondition: CapCheckResult.ok === true AND (hitl_required === false OR hitl_status === "approved")
+ * Precondition: CapCheckResult.ok === true (deterministic authorization; no human step)
  */
 import { TonClient, Address, toNano, fromNano } from "@ton/ton";
 import { CONFIG, isTestnet } from "../../config";
@@ -13,14 +13,14 @@ import { makeClient, loadKeyPairForTier, openWallet } from "../../wallet/wallet"
 import { executeSwap, getSwapQuote, computeMinOut, type Dex, type SwapRequest, type SwapResult } from "../../dex/router";
 import { resolvePool, type PoolResolutionResult } from "../../security/pool-resolver";
 import { getTierSlippageCeilingBps } from "../../risk/guardrails";
-import type { CapCheckResult, TradeTicket, Tier, AuthorizedExecution } from "../../safetycaps";
-import { verifyCapBinding, hashTradeTicket } from "../../safetycaps";
+import type { CapCheckResult, TradeTicket, AuthorizedExecution } from "../../safetycaps";
+import { verifyCapBinding, hashTradeTicket, CAPS_VERSION } from "../../safetycaps";
 import { decisionJournalStore } from "../../storage/store";
 import { newId } from "@ton-agent/shared";
 
 export interface ExecutionInput {
   cycle_id: string;
-  /** Pre-authorized execution envelope from SafetyCaps + HITL */
+  /** Pre-authorized execution envelope from SafetyCaps */
   authorized: AuthorizedExecution;
   /** Optional DEX override (normally resolved by pool location) */
   dex_override?: Dex;
@@ -38,15 +38,16 @@ export interface ExecutionOutput {
  * This is the ONLY path that should reach the signer.
  */
 function verifyAuthorization(auth: AuthorizedExecution): { allowed: boolean; reason?: string } {
-  const { ticket, cap, hitl } = auth;
+  const { ticket, cap } = auth;
 
   // 1. Cap must be ok
   if (!cap.ok) {
     return { allowed: false, reason: "cap check not ok" };
   }
 
-  // 2. Version match
-  if (cap.caps_version !== "safetycaps-v1") {
+  // 2. Version match — imported, never a literal, so a CAPS_VERSION bump
+  //    invalidates stale authorizations instead of silently honoring them.
+  if (cap.caps_version !== CAPS_VERSION) {
     return { allowed: false, reason: `caps_version mismatch: ${cap.caps_version}` };
   }
 
@@ -64,28 +65,18 @@ function verifyAuthorization(auth: AuthorizedExecution): { allowed: boolean; rea
     return { allowed: false, reason: "cycle_id mismatch" };
   }
 
-  // 5. HITL status
-  if (cap.hitl_required) {
-    if (hitl !== "approved" && cap.hitl_status !== "approved") {
-      return {
-        allowed: false,
-        reason: `HITL required but status=${hitl ?? cap.hitl_status}`,
-      };
-    }
-  }
-
   return { allowed: true };
 }
 
 /**
  * Mechanical execution — no LLM, no reasoning.
- * All safety checks already passed in SafetyCaps + HITL.
+ * All safety checks already passed in SafetyCaps.
  */
 export async function executionNode(
   input: ExecutionInput,
 ): Promise<ExecutionOutput> {
   const { cycle_id, authorized, dex_override } = input;
-  const { ticket, cap, hitl } = authorized;
+  const { ticket, cap } = authorized;
 
   // Final verification (defense in depth)
   const verify = verifyAuthorization(authorized);
@@ -97,7 +88,6 @@ export async function executionNode(
       agent: "execution",
       input_hash: cap.ticket_hash,
       cap_check_result: cap,
-      hitl_status: hitl,
       final_action: "execute_denied_auth_verify",
       output: { error: reason },
     });
@@ -175,7 +165,6 @@ export async function executionNode(
     agent: "execution",
     input_hash: cap.ticket_hash,
     cap_check_result: cap,
-    hitl_status: hitl,
     final_action: "execute_submit",
     output: { dex: execDex, side: ticket.side, amountTon: ticket.amount_ton },
   });
@@ -207,18 +196,16 @@ export async function executionNode(
 }
 
 /**
- * Convenience: build AuthorizedExecution from ticket + cap + hitl status.
- * Used by supervisor after HITL resolves.
+ * Convenience: build AuthorizedExecution from ticket + cap.
+ * Deterministic authorization only — there is no approval step.
  */
 export function makeAuthorizedExecution(
   ticket: TradeTicket,
   cap: CapCheckResult,
-  hitl: CapCheckResult["hitl_status"] | "approved" = cap.hitl_status,
 ): AuthorizedExecution {
   return {
     ticket,
     cap,
-    hitl,
     idempotency_key: `${cap.cycle_id}:${cap.ticket_hash}`,
   };
 }
