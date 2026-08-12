@@ -711,3 +711,36 @@ user_setup:
 Each plan creates `.planning/phases/03-ultra-acceleration/{plan-id}-SUMMARY.md` on completion.
 
 **Next**: Run `/gsd:execute-phase 00-01-policy-matrix-transport` to begin.
+
+---
+
+## Autonomous Execution (2026-08-12) — HITL removed
+
+`CAPS_VERSION` is now `safetycaps-v2`. Pre-v2 authorizations are rejected by
+`verifyCapBinding` and `verifyAuthorization`.
+
+**What changed:** the human approval gate is gone. `hitl_required` /
+`hitl_status` were removed from `CapCheckResult` and `AuthorizedExecution`,
+the `hitl` graph node and `src/telegram/` were deleted, and
+`decision_journal` no longer writes `hitl_status`.
+
+**Behavioral delta:** a `caution` risk verdict now **executes at full size**.
+Previously it set `hitl_required=true`, and because nothing ever called
+`resolveHitl`, such trades dead-ended at `coordinator.ts` without executing.
+So this converts a silent no-trade into a real trade — the single most
+important consequence of this change.
+
+**Dead config, now ignored:** `HITL_DISABLE`, `HITL_MIN_AI_SCORE`,
+`AUTO_APPROVE_CEILING_PCT`. `AUTO_APPROVE_CEILING_PCT` was already inert: it
+defaulted to 100%, making the ceiling test `amount > balance * 1.0`
+unreachable behind the `BANKROLL` gate (`amount + gas <= balance`).
+
+**Remaining gates (unchanged, all deterministic):** OBSERVE_ONLY,
+KILL_SWITCH, HIGH_LOCKED, CIRCUIT_BREAKER, BAD_SIZE, BAD_JETTON,
+RISK_REJECT, TIER_CAP, BANKROLL, MAX_OPEN, ALLOCATION, SLIPPAGE, POOL_TVL,
+DEPTH, POOL_TVL_REQUIRED, AI_SCORE.
+
+**Rollback:** revert the commit range for this change. Because
+`CAPS_VERSION` moves back to `safetycaps-v1`, in-flight v2 authorizations
+are invalidated on rollback rather than honored — fail-closed in both
+directions.
