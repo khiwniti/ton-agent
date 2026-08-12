@@ -37,12 +37,16 @@ export interface TodoItem {
 export interface GramTradeState {
   cycle_id: string;
   tier: Tier;
+  /** Optional seed from scheduler or Telegram command */
+  seed_jetton_master?: string;
   candidate: JettonCandidate | null;
   risk_assessment: RiskAssessment | null;
   proposed_ticket: TradeTicket | null;
   cap_check_result: CapCheckResult | null;
   hitl_status: HitlStatus;
   execution_result: ExecutionResult | null;
+  /** Current open positions for context */
+  open_positions: number;
   /** When true, cycle must stop without execution. */
   discarded: boolean;
   discard_reason?: string;
@@ -60,6 +64,7 @@ export function emptyGramState(
     cap_check_result: null,
     hitl_status: "not_required",
     execution_result: null,
+    open_positions: 0,
     discarded: false,
     todo_plan: [],
     ...partial,
