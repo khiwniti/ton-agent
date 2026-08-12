@@ -6,10 +6,41 @@
  */
 import { TonClient, WalletContractV3R2, WalletContractV4, WalletContractV5R1 } from "@ton/ton";
 import { mnemonicToPrivateKey, mnemonicToHDSeed, deriveEd25519Path, keyPairFromSeed } from "@ton/crypto";
+import axios from "axios";
 import { CONFIG } from "../config";
+import { acquireStonFiSlot, releaseStonFiSlot } from "../http/rate-limit";
+
+/**
+ * Axios adapter that funnels every toncenter RPC POST through the shared
+ * STON.fi rate-limit bucket.
+ *
+ * Why: the STON.fi "failed to get Ston.fi pool: 429" errors in prod are NOT
+ * STON.fi REST calls — they are on-chain `runMethod` JSON-RPC posts to
+ * `CONFIG.rpcEndpoint` (toncenter.com), issued by the @ton/ton SDK when the
+ * router resolves pool addresses / reads pool data. toncenter rate-limits by
+ * API key, and with five concurrent subsystems (sniper scan, sniper monitor,
+ * position monitor, coordinator, MCP) firing RPCs on the same beat we trip
+ * it constantly. The adapter lets us serialize those RPC posts under one
+ * bucket instead of stampeding the shared upstream.
+ *
+ * `axios.getAdapter(["http","fetch","xhr"])` resolves the platform default
+ * adapter lazily, so this works in both Node (http) and edge/worker runtimes
+ * without importing a runtime-specific module.
+ */
+function makeThrottledAdapter() {
+  const defaultAdapter = axios.getAdapter(["http", "fetch", "xhr"]);
+  return async (config: import("axios").InternalAxiosRequestConfig) => {
+    await acquireStonFiSlot();
+    try {
+      return await defaultAdapter(config);
+    } finally {
+      releaseStonFiSlot();
+    }
+  };
+}
 
 export function makeClient(): TonClient {
-  return new TonClient({ endpoint: CONFIG.rpcEndpoint });
+  return new TonClient({ endpoint: CONFIG.rpcEndpoint, httpAdapter: makeThrottledAdapter() });
 }
 
 export interface KeyPair {
