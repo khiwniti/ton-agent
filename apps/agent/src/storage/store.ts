@@ -134,6 +134,10 @@ db.exec(`
   );
 
   -- GRAM Phase 1: append-only decision journal (never UPDATE in place)
+  -- NOTE: the approval-status column was removed in safetycaps-v2
+  -- (autonomous execution). Existing deployed DBs keep the physical
+  -- column because SQLite cannot cheaply drop one; it simply stops being
+  -- written. Do not add a destructive migration to "clean" it.
   CREATE TABLE IF NOT EXISTS decision_journal (
     id TEXT PRIMARY KEY,
     cycle_id TEXT NOT NULL,
@@ -144,7 +148,6 @@ db.exec(`
     tool_calls TEXT,
     output TEXT,
     cap_check_result TEXT,
-    hitl_status TEXT,
     final_action TEXT NOT NULL
   );
 
@@ -617,7 +620,6 @@ export interface DbJournalEntry {
   tool_calls?: string | null;
   output?: string | null;
   cap_check_result?: string | null;
-  hitl_status?: string | null;
   final_action: string;
 }
 
@@ -630,7 +632,6 @@ export interface JournalAppendInput {
   tool_calls?: unknown;
   output?: unknown;
   cap_check_result?: unknown;
-  hitl_status?: string;
   /** Optional stable id; auto-generated when omitted. */
   id?: string;
 }
@@ -664,16 +665,15 @@ export const decisionJournalStore = {
       tool_calls: jsonOrNull(entry.tool_calls),
       output: jsonOrNull(entry.output),
       cap_check_result: jsonOrNull(entry.cap_check_result),
-      hitl_status: entry.hitl_status ?? null,
       final_action: entry.final_action,
     };
     db.prepare(`
       INSERT INTO decision_journal (
         id, cycle_id, ts, agent, model_used, input_hash,
-        tool_calls, output, cap_check_result, hitl_status, final_action
+        tool_calls, output, cap_check_result, final_action
       ) VALUES (
         @id, @cycle_id, @ts, @agent, @model_used, @input_hash,
-        @tool_calls, @output, @cap_check_result, @hitl_status, @final_action
+        @tool_calls, @output, @cap_check_result, @final_action
       )
     `).run(row);
     return id;
@@ -702,8 +702,8 @@ export const decisionJournalStore = {
 };
 
 // ─────────────────────────────────────────────────────────────────────
-// First-trade HITL gate — persisted in agent_settings so a restart after
-// the first trade does not re-arm the human approval requirement.
+// First-trade gate — persisted in agent_settings so a restart after
+// the first trade does not re-arm the (removed) approval requirement.
 // ─────────────────────────────────────────────────────────────────────
 const getSetting = db.prepare("SELECT value FROM agent_settings WHERE key = ?");
 const setSetting = db.prepare(`

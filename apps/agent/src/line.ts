@@ -30,7 +30,7 @@ export function createLineClient(): LineClient | null {
 }
 
 /**
- * Handle an incoming LINE webhook request (spec 006 Phase 8 — LINE HITL).
+ * Handle an incoming LINE webhook request (spec 006 Phase 8 — LINE ops webhook).
  * Verifies the x-line-signature HMAC when a channel token is configured,
  * otherwise accepts the payload. Always returns a JSON-serializable object.
  */

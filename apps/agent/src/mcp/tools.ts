@@ -133,7 +133,6 @@ export const executeSwapTool = tool(
             // Surface cap outcome so the model cannot ignore a denial.
             cap_ok: r.cap?.ok,
             ticket_hash: r.cap?.ticket_hash ?? r.cycle_id,
-            hitl_required: r.cap?.hitl_required,
         };
     },
     {
@@ -142,7 +141,7 @@ export const executeSwapTool = tool(
             "Execute a real signed BUY or SELL on Ston.fi or DeDust through the tier coordinator. " +
             "Every call runs deterministic SafetyCaps (kill-switch, circuit breaker, tier caps, allocation, optional depth/slippage/risk verdict) before signing. " +
             "Optional ticketHash must match a previously issued SafetyCaps authorization for the same ticket. " +
-            "riskVerdict=reject always denies; caution requires HITL (not auto-executable until Telegram approval lands). " +
+            "riskVerdict=reject always denies; caution is advisory only and executes. " +
             "Losses can be 100% of amountTon — verify size thrice.",
         schema: z.object({
             jettonMaster: z.string(),
@@ -156,7 +155,7 @@ export const executeSwapTool = tool(
             ticketHash: z.string().optional()
                 .describe("Optional SafetyCaps ticket_hash from a prior authorize step; must match live ticket."),
             riskVerdict: z.enum(["pass", "caution", "reject"]).optional()
-                .describe("Advisory risk verdict from audit/risk step. reject blocks; caution forces HITL."),
+                .describe("Advisory risk verdict from audit/risk step. reject blocks; caution is advisory only."),
             poolTvlTon: z.number().positive().optional()
                 .describe("Pool TVL in TON for liquidity-depth gate."),
             slippagePct: z.number().nonnegative().optional()

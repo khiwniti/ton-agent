@@ -31,7 +31,6 @@ export function makeSafetyCapsNode(getContext: CapContextFactory) {
     if (!cap.ok) {
       return {
         cap_check_result: cap,
-        hitl_status: cap.hitl_status,
         discarded: true,
         discard_reason:
           cap.failures.map((f) => f.reason).join("; ") || "cap denied",
@@ -40,8 +39,6 @@ export function makeSafetyCapsNode(getContext: CapContextFactory) {
 
     return {
       cap_check_result: cap,
-      hitl_status: cap.hitl_required ? "pending" : "not_required",
-      // HITL-required tickets are not discarded — they pause for approval.
       discarded: false,
     };
   };

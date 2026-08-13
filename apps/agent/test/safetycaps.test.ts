@@ -16,7 +16,6 @@ import {
   hashTradeTicket,
   issueAuthorization,
   verifyCapBinding,
-  withHitlApproved,
   type CapCheckContext,
   type TradeTicket,
 } from "../src/safetycaps";
@@ -43,6 +42,27 @@ function baseCtx(overrides: Partial<CapCheckContext> = {}): CapCheckContext {
   };
 }
 
+function ctx(overrides: Partial<CapCheckContext> = {}): CapCheckContext {
+  return {
+    balance_ton: 10,
+    open_positions: 0,
+    max_position_ton: 5,
+    max_open: 3,
+    min_ai_score: 50,
+    unlocked: true,
+    kill_switch_active: false,
+    circuit_breaker_ok: true,
+    observe_only: false,
+    daily_pnl_ton: 0,
+    max_portfolio_allocation_pct: 50, // 5 TON of 10
+    max_slippage_pct: 1.5,
+    max_trade_pool_tvl_pct: 5,
+    require_pool_tvl: false,
+    gas_cushion_ton: 0.3,
+    ...overrides,
+  };
+}
+
 function buyTicket(overrides: Partial<TradeTicket> = {}): TradeTicket {
   return {
     cycle_id: "cycle_test_1",
@@ -55,13 +75,11 @@ function buyTicket(overrides: Partial<TradeTicket> = {}): TradeTicket {
   };
 }
 
-test("happy path: small buy with pass verdict is ok and not HITL", () => {
-  const t = buyTicket();
-  const r = checkTicket(t, baseCtx());
+test("happy path: small buy with pass verdict is ok", () => {
+  const r = checkTicket(buyTicket({ risk: { score: 90, verdict: "pass" } }), ctx());
   assert.equal(r.ok, true);
-  assert.equal(r.hitl_required, false);
-  assert.equal(r.caps_version, CAPS_VERSION);
-  assert.equal(r.ticket_hash, hashTradeTicket(t));
+  assert.equal(r.failures.length, 0);
+  assert.equal(r.caps_version, "safetycaps-v2");
 });
 
 test("hash is stable for same ticket fields", () => {
@@ -76,23 +94,25 @@ test("hash changes when amount changes", () => {
   assert.notEqual(hashTradeTicket(a), hashTradeTicket(b));
 });
 
-test("risk verdict reject is hard fail", () => {
+test("reject verdict still hard-fails", () => {
   const r = checkTicket(
-    buyTicket({ risk: { score: 0, verdict: "reject" } }),
-    baseCtx(),
+    buyTicket({ risk: { score: 5, verdict: "reject" } }),
+    ctx(),
   );
   assert.equal(r.ok, false);
   assert.ok(r.failures.some((f) => f.code === "RISK_REJECT"));
 });
 
-test("caution forces HITL even when otherwise ok", () => {
+test("caution verdict executes autonomously — no approval gate", () => {
   const r = checkTicket(
     buyTicket({ risk: { score: 55, verdict: "caution" } }),
-    baseCtx(),
+    ctx(),
   );
-  assert.equal(r.ok, true);
-  assert.equal(r.hitl_required, true);
-  assert.equal(r.hitl_status, "pending");
+  assert.equal(r.ok, true, "caution must not block");
+  assert.equal(r.failures.length, 0);
+  // The old build exposed hitl_required/hitl_status here. They must be gone.
+  assert.equal("hitl_required" in r, false);
+  assert.equal("hitl_status" in r, false);
 });
 
 test("kill-switch denies buys and sells", () => {
@@ -133,31 +153,40 @@ test("require_pool_tvl fails closed when missing", () => {
   assert.ok(r.failures.some((f) => f.code === "POOL_TVL_REQUIRED"));
 });
 
-test("auto-approve ceiling forces HITL when size exceeds % of balance", () => {
-  // balance 10, ceiling 1% => 0.1 TON; amount 0.5 requires HITL
+test("large caution buy still bounded by tier cap, not by approval", () => {
+  // Previously this would have been routed to HITL. Now it must be REJECTED
+  // outright by TIER_CAP — proving the deterministic gates carry the load.
   const r = checkTicket(
-    buyTicket({ amount_ton: 0.5 }),
-    baseCtx({ auto_approve_ceiling_pct: 1 }),
+    buyTicket({ amount_ton: 999, risk: { score: 55, verdict: "caution" } }),
+    ctx(),
   );
-  assert.equal(r.ok, true);
-  assert.equal(r.hitl_required, true);
+  assert.equal(r.ok, false);
+  assert.ok(r.failures.some((f) => f.code === "TIER_CAP"));
 });
 
 test("verifyCapBinding rejects forged ok result with wrong hash", () => {
   const ticket = buyTicket();
-  const real = checkTicket(ticket, baseCtx());
+  const real = checkTicket(ticket, ctx());
   const forged = { ...real, ticket_hash: "deadbeef".repeat(4) };
   const v = verifyCapBinding(ticket, forged);
   assert.equal(v.allowed, false);
   assert.ok(v.reason?.includes("ticket_hash mismatch"));
 });
 
-test("verifyCapBinding requires HITL approved when hitl_required", () => {
+test("verifyCapBinding allows a bound cap with no approval step", () => {
   const ticket = buyTicket({ risk: { score: 40, verdict: "caution" } });
-  const cap = checkTicket(ticket, baseCtx());
-  assert.equal(cap.hitl_required, true);
-  assert.equal(verifyCapBinding(ticket, cap).allowed, false);
-  assert.equal(verifyCapBinding(ticket, withHitlApproved(cap)).allowed, true);
+  const cap = checkTicket(ticket, ctx());
+  assert.equal(cap.ok, true);
+  assert.equal(verifyCapBinding(ticket, cap).allowed, true);
+});
+
+test("verifyCapBinding rejects a stale v1 authorization", () => {
+  const ticket = buyTicket({ risk: { score: 90, verdict: "pass" } });
+  const cap = checkTicket(ticket, ctx());
+  const stale = { ...cap, caps_version: "safetycaps-v1" };
+  const res = verifyCapBinding(ticket, stale);
+  assert.equal(res.allowed, false);
+  assert.ok(res.reason?.includes("caps_version"));
 });
 
 test("registry: only issued authorizations can be consumed", () => {

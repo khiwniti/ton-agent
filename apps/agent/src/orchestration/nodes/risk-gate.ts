@@ -1,6 +1,6 @@
 /**
  * Deterministic risk gate node — not an LLM step.
- * reject → discard; caution/pass continue (caution later forces HITL in SafetyCaps).
+ * reject → discard; caution/pass continue (caution is advisory only).
  */
 import type { GramTradeState } from "../state";
 
@@ -12,7 +12,6 @@ export function riskGateNode(state: GramTradeState): Partial<GramTradeState> {
     return {
       discarded: true,
       discard_reason: "risk verdict reject — auto-discard",
-      hitl_status: "not_required",
     };
   }
 

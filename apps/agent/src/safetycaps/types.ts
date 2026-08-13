@@ -8,12 +8,6 @@
  */
 
 export type RiskVerdict = "pass" | "caution" | "reject";
-export type HitlStatus =
-  | "not_required"
-  | "pending"
-  | "approved"
-  | "denied"
-  | "timeout";
 export type Tier = "low" | "mid" | "high";
 export type TradeSide = "buy" | "sell";
 
@@ -58,9 +52,6 @@ export interface CapCheckResult {
   ticket_hash: string;
   cycle_id: string;
   caps_version: string;
-  /** When true, Telegram (or other HITL) must approve before execute. */
-  hitl_required: boolean;
-  hitl_status: HitlStatus;
   failures: CapCheckFailure[];
   /** Echo of size used for the check (may be clamped later by caller). */
   amount_ton: number;
@@ -70,11 +61,11 @@ export interface CapCheckResult {
 
 /**
  * Fully authorized execution envelope — only path that should reach the signer.
+ * Authorization is purely deterministic: a bound, ok CapCheckResult is sufficient.
  */
 export interface AuthorizedExecution {
   ticket: TradeTicket;
   cap: CapCheckResult;
-  hitl: HitlStatus;
   idempotency_key: string;
 }
 
@@ -91,8 +82,6 @@ export interface CapCheckContext {
   circuit_breaker_ok: boolean;
   observe_only: boolean;
   daily_pnl_ton: number;
-  /** % of sub-wallet balance that may auto-execute without HITL. */
-  auto_approve_ceiling_pct: number;
   /** Max portfolio allocation per trade (% of balance). */
   max_portfolio_allocation_pct: number;
   /** Max acceptable slippage %. */

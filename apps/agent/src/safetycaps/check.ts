@@ -13,7 +13,7 @@ import type {
 } from "./types";
 
 /** Bump when check semantics change so old authorizations cannot be reused. */
-export const CAPS_VERSION = "safetycaps-v1";
+export const CAPS_VERSION = "safetycaps-v2";
 
 /**
  * Stable hash of the ticket fields that define the economic intent.
@@ -85,8 +85,6 @@ export function checkTicket(
     return {
       ...base,
       ok,
-      hitl_required: false,
-      hitl_status: "not_required",
       failures,
     };
   }
@@ -115,7 +113,7 @@ export function checkTicket(
     failures.push(fail("BAD_JETTON", "jetton_master is required"));
   }
 
-  // Risk verdict — reject never proceeds; caution forces HITL
+  // Risk verdict — reject hard-fails. caution is advisory only and executes.
   const verdict = ticket.risk?.verdict;
   if (verdict === "reject") {
     failures.push(fail("RISK_REJECT", "risk verdict is reject — auto-discard"));
@@ -216,18 +214,9 @@ export function checkTicket(
 
   const ok = failures.length === 0;
 
-  // HITL: caution always; size above auto-approve ceiling of sub-wallet
-  const ceilingTon =
-    ctx.balance_ton * (ctx.auto_approve_ceiling_pct / 100);
-  const overCeiling = ticket.amount_ton > ceilingTon;
-  const caution = verdict === "caution";
-  const hitl_required = ok && (caution || overCeiling);
-
   return {
     ...base,
     ok,
-    hitl_required,
-    hitl_status: hitl_required ? "pending" : "not_required",
     failures,
   };
 }
@@ -239,7 +228,6 @@ export function checkTicket(
 export function verifyCapBinding(
   ticket: TradeTicket,
   cap: CapCheckResult,
-  hitl: CapCheckResult["hitl_status"] | "approved" | "not_required" = cap.hitl_status,
 ): { allowed: boolean; reason?: string } {
   if (!cap.ok) {
     return { allowed: false, reason: "cap check not ok" };
@@ -257,23 +245,5 @@ export function verifyCapBinding(
   if (cap.cycle_id !== ticket.cycle_id) {
     return { allowed: false, reason: "cycle_id mismatch" };
   }
-  if (cap.hitl_required) {
-    if (hitl !== "approved" && cap.hitl_status !== "approved") {
-      return {
-        allowed: false,
-        reason: `HITL required but status=${hitl ?? cap.hitl_status}`,
-      };
-    }
-  }
   return { allowed: true };
-}
-
-/**
- * Mark HITL approved on a prior CapCheckResult (immutable copy).
- */
-export function withHitlApproved(cap: CapCheckResult): CapCheckResult {
-  return {
-    ...cap,
-    hitl_status: "approved",
-  };
 }

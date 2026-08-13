@@ -135,13 +135,12 @@ test("each exit trigger type is recorded correctly as final_action", () => {
   }
 });
 
-test("append with optional fields (model_used, hitl_status, etc.)", () => {
+test("append with optional fields (model_used, cap_check_result, etc.)", () => {
   const id = decisionJournalStore.append({
     cycle_id: "cycle_with_opts",
     agent: "position-monitor",
     final_action: "take_profit",
     model_used: "gpt-4",
-    hitl_status: "operator_approved",
     input_hash: "abc123",
     tool_calls: { swap: "executeSwap" },
     output: { reason: "pnl >= 25%" },
@@ -151,7 +150,6 @@ test("append with optional fields (model_used, hitl_status, etc.)", () => {
   const entry = decisionJournalStore.get(id);
   assert.ok(entry);
   assert.equal(entry.model_used, "gpt-4");
-  assert.equal(entry.hitl_status, "operator_approved");
   assert.equal(entry.input_hash, "abc123");
   // JSON fields are stored as strings (via jsonOrNull helper)
   assert.ok(entry.tool_calls); // should be a JSON string
